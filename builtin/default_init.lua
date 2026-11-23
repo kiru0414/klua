@@ -295,9 +295,14 @@ end
 -- In-repo klua.yaml manifests
 -- ---------------------------------------------------------------------------
 
-local function fetch_manifest(raw_base, user, name, tag)
+local function fetch_manifest(raw_base, user, name, tag, style)
     local ref = tag or "HEAD"
-    local url = raw_base .. "/" .. user .. "/" .. name .. "/" .. ref .. "/klua.yaml"
+    local url
+    if style == "gitlab" then
+        url = raw_base .. "/" .. user .. "/" .. name .. "/-/raw/" .. ref .. "/klua.yaml"
+    else
+        url = raw_base .. "/" .. user .. "/" .. name .. "/" .. ref .. "/klua.yaml"
+    end
     local body, status, err = klua.http_get(url)
     if err or status ~= 200 then
         return nil
@@ -638,7 +643,7 @@ local function gitlab_install(rest)
         return 1
     end
 
-    local manifest = fetch_manifest(klua.raw_gitlab, user, name, tag)
+    local manifest = fetch_manifest(klua.raw_gitlab, user, name, tag, "gitlab")
 
     local project = user .. "%2F" .. name
     local endpoint = tag and ("releases/" .. tag) or "releases/permalink/latest"

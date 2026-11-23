@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Build & test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev unzip
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      - name: Milestone 1 tests (offline)
+        run: bash tests/test_milestone1.sh
+
+      - name: Milestone 2 tests (network)
+        run: bash tests/test_milestone2.sh
+
+      - name: Milestone 3 tests (manifests, sync, upgrade)
+        run: bash tests/test_milestone3.sh
+
+  build-macos:
+    name: Build (macOS arm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      - name: Smoke test
+        run: |
+          ./build/klua --version
+          ./build/klua repair
+          ./build/klua list

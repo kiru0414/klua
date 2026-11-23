@@ -6,6 +6,13 @@ A fast, zero-dependency, self-healing package manager built with **C++20** and
 Heavy lifting (HTTP, extraction, filesystem, YAML) lives in native C++20;
 resolution logic, providers and lifecycle hooks are extensible in Lua.
 
+## Documentation
+
+- [Getting started](docs/getting-started.md) — installation, XDG paths, CLI, self-healing
+- [klua.yaml manifests](docs/klua-yaml.md) — assets, bins, configs, build.steps
+- [Lua API reference](docs/lua-api.md) — native primitives, hooks, recipes
+- [Taps & registry](docs/taps-and-registry.md) — alias sharding, hosting a tap, contributing aliases
+
 ## Status
 
 Milestones 1, 2 and 3 are implemented:
