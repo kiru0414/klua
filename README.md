@@ -1,4 +1,4 @@
-![](docs/asset/logo.svg)
+![](docs/asset/logo-1.svg)
 # klua
 
 A fast, zero-dependency, self-healing package manager built with **C++20** and
