@@ -13,10 +13,11 @@ every `v*` release:
 
 ```sh
 curl -fLO https://github.com/kiru0414/klua/releases/download/v0.3.0/klua-0.3.0-linux-x86_64.tar.gz
-tar -xzf "klua*.tar.gz"
+tar -xzf klua*.tar.gz
 mkdir -p ~/.local/bin
-install -m 755 klua ~/.local/bin/klua
+install -m 755 $(find . -maxdepth 2 -name klua -type f | head -n 1) ~/.local/bin/klua
 klua --version
+
 ```
 
 Make sure `~/.local/bin` is on your `PATH`:
