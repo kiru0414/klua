@@ -6,8 +6,8 @@ repo_name: kiru0414/klua
 
 theme:
   name: material
-  logo: assets/logo.svg
-  favicon: assets/logo.svg  
+  logo: asset/logo.svg
+  favicon: asset/logo.svg  
   palette:
     - scheme: default
       primary: indigo
