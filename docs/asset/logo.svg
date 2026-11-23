@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <defs>
+            <clipPath id="moon-clip-2">
+              <circle cx="12" cy="12" r="9.2"></circle>
+            </clipPath>
+          </defs>
+          <!-- 月の輪郭 -->
+          <circle cx="12" cy="12" r="9.2"></circle>
+          <!-- 円の右下半分に収まる土蔵 -->
+          <g clip-path="url(#moon-clip-2)">
+            <!-- 鬼瓦（棟） -->
+            <path d="M13 6.8h3" stroke-width="2"></path>
+            <!-- 反りのある瓦屋根 -->
+            <path d="M8 11.5Q11.5 9.8 14.5 7Q17.5 9.8 21 11.5"></path>
+            <!-- 軒下の鉢巻（段差ライン） -->
+            <path d="M10.5 11.2h8" stroke-width="1.5"></path>
+            <!-- 蔵の分厚い壁（少し内側にすぼまる台形シルエット） -->
+            <path d="M10.3 10.5L9.8 21.5h9.4l-.5-11"></path>
+            <!-- 2階の虫籠窓（むしこまど・縦格子） -->
+            <rect x="12.5" y="13" width="4" height="2.2" rx="0.4" stroke-width="1.4"></rect>
+            <line x1="14.5" y1="13" x2="14.5" y2="15.2" stroke-width="1.2"></line>
+            <!-- 1階の重厚な観音扉 -->
+            <rect x="12.5" y="17" width="4" height="4.5" stroke-width="1.5"></rect>
+            <line x1="14.5" y1="17" x2="14.5" y2="21.5" stroke-width="1.2"></line>
+          </g>
+        </svg>
