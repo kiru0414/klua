@@ -1,4 +1,5 @@
-![](docs/asset/logo.svg)# klua
+![](docs/asset/logo.svg)
+# klua
 
 A fast, zero-dependency, self-healing package manager built with **C++20** and
 **Lua 5.4** (sol2), targeting **Linux and macOS**.
