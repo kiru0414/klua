@@ -1,0 +1,12 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+
+# CMake artifacts
+CMakeUserPresets.json
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store

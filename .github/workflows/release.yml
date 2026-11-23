@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+            static: true
+          - os: ubuntu-24.04-arm
+            artifact: linux-arm64
+            static: true
+          - os: macos-13
+            artifact: macos-x86_64
+            static: false
+          - os: macos-14
+            artifact: macos-arm64
+            static: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Configure (static Linux)
+        if: matrix.static
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_EXE_LINKER_FLAGS=-static
+          -DOPENSSL_USE_STATIC_LIBS=ON
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      - name: Smoke test
+        run: |
+          ./build/klua --version
+          ./build/klua repair
+          ./build/klua list
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf "dist/klua-${{ github.ref_name }}-${{ matrix.artifact }}.tar.gz" \
+            -C build klua \
+            -C "$GITHUB_WORKSPACE" README.md LICENSE
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: klua-${{ matrix.artifact }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
