@@ -12,9 +12,10 @@ Static Linux binaries (x86_64, arm64) and macOS binaries are attached to
 every `v*` release:
 
 ```sh
-curl -LO https://github.com/kiru0414/klua/releases/latest/download/klua-v0.3.0-linux-x86_64.tar.gz
-tar -xzf klua-v0.3.0-linux-x86_64.tar.gz
-install -m 755 klua ~/.local/bin/klua   # or /usr/local/bin
+curl -fLO https://github.com/kiru0414/klua/archive/refs/tags/v0.3.0.tar.gz
+tar -xzf v0.3.0.tar.gz
+mkdir -p ~/.local/bin
+install -m 755 klua ~/.local/bin/klua
 klua --version
 ```
 
