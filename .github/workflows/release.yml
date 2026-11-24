@@ -19,10 +19,7 @@ jobs:
           - os: ubuntu-latest
             artifact: linux-x86_64
             static: true
-          - os: ubuntu-24.04-arm
-            artifact: linux-arm64
-            static: true
-          - os: macos-14
+          - os: macos-latest
             artifact: macos-arm64
             static: false
 
