@@ -11,6 +11,26 @@ Available Lua libraries: `base`, `string`, `table`, `math`, `os`,
 `coroutine`, `utf8`. There is no `io` or `package` — use the native file
 primitives below.
 
+> **Safer than Homebrew, simpler than Nix, and infinitely hackable in Lua.**
+> The C++ core enforces the isolated store, keeps shared libraries out of
+> `~/.local/bin` and checks PATH conflicts before linking; Lua is where you
+> redefine policy. A bad `init.lua` never bricks klua because the embedded
+> baseline reloads automatically, and `repair` backs up your custom code.
+
+## Design philosophy in Lua
+
+- Every package version is unpacked under `klua.paths.store`; only chosen
+  executable symlinks belong in `klua.paths.bin`.
+- Library names are filtered by the baseline's `safe_link` helper. Use
+  `klua.install_opts.link = false` for store-only installs and expose
+  libraries only to `klua run`.
+- The baseline scans `klua.env("PATH")` before linking and protects core
+  commands. `--force` and `--as NAME` are surfaced as `install_opts.force`
+  and `install_opts.as` for CLI-driven installs.
+- Rebind `klua.commands.run`, `klua.commands.search`, `klua.commands.info`,
+  `klua.commands.cleanup`, `klua.commands.doctor` or `klua.commands.remove`
+  just like any other handler — no rebuild required.
+
 ## Globals
 
 | Name | Type | Meaning |
@@ -19,7 +39,7 @@ primitives below.
 | `klua.paths` | table | `config`, `store`, `bin`, `cache`, `init`, `packages`, `taps` (absolute path strings) |
 | `klua.providers` | table | scheme -> `function(rest, target)` |
 | `klua.commands` | table | command name -> `function(args)` returning an exit code |
-| `klua.install_opts` | table | install-time flags: `force` (override link guards) and `link` (`false` = store-only install) |
+| `klua.install_opts` | table | install-time flags: `force` (override link guards), `link` (`false` = store-only install), `as` (primary link name from `--as`) |
 | `klua.registries` | array | registry base URLs for alias sharding (defaults to the official registry) |
 
 ### Service endpoint overrides
@@ -163,14 +183,16 @@ The baseline routes every link through a local `safe_link` helper (in
 `builtin/default_init.lua`). It checks, in order:
 
 1. `klua.install_opts.link == false` → skip linking entirely (store-only).
-2. Library-looking names (`.so`, `.so.*`, `.dylib`, `.a`, `.la`, `.dll`) →
+2. `klua.install_opts.as` → rename the first linked binary to that command
+   name (from the CLI's `--as NAME`); extra binaries keep their own names.
+3. Library-looking names (`.so`, `.so.*`, `.dylib`, `.a`, `.la`, `.dll`) →
    warn and leave the file inside the store.
-3. Existing non-klua links/files at the destination → warn and skip unless
+4. Existing non-klua links/files at the destination → warn and skip unless
    `klua.install_opts.force` is set.
-4. Protected core command names (shells, coreutils, network tools, language
+5. Protected core command names (shells, coreutils, network tools, language
    runtimes, compilers, system package managers, editors and `klua`) → warn
    and skip unless forced.
-5. A same-named executable elsewhere on `PATH` → warn and skip unless forced.
+6. A same-named executable elsewhere on `PATH` → warn and skip unless forced.
 
 A skipped link still counts as success: the package is staged in the store.
 Links that already point into the store are replaced, so upgrades work. The
@@ -180,9 +202,17 @@ CLI sets these options per invocation:
 -- klua install --force ...
 klua.install_opts = { force = true, link = true }
 
+-- klua install --as jq2 jq ...
+klua.install_opts = { force = false, link = true, as = "jq2" }
+
 -- klua run ... (install missing package store-only)
 klua.install_opts = { force = false, link = false }
 ```
+
+The CLI validates `--as` before dispatch: it must be a single non-empty name,
+cannot contain `/`, `.`, `..` or control characters, and can only be combined
+with one install target. The chosen name then goes through exactly the same
+library, occupancy, protected-command and PATH guards described above.
 
 `klua run` executes the chosen binary through the shell with store `bin`
 directories prepended to `PATH` and store library directories prepended to
@@ -191,6 +221,22 @@ library directories up to two levels deep and `shq()`-style single-quote
 escaping for every argument. Custom providers that create links themselves
 should respect `klua.install_opts.link` and perform equivalent conflict
 checks using `klua.readlink`, `klua.is_executable` and `klua.env("PATH")`.
+
+## Self-healing and `klua repair`
+
+The embedded baseline is loaded before your `init.lua`; a syntax/runtime error
+in your file is reported and the baseline is reloaded automatically. `repair`
+is implemented natively so it works even when Lua is broken:
+
+- `klua repair` copies the current file to
+  `~/.config/klua/init.lua.bak.<timestamp>`, prints that path, then writes the
+  embedded baseline. If the file already matches, nothing is written.
+- `klua repair --dry-run` (alias `--diff`) prints the backup path and a
+  unified diff of the pending change and touches no files.
+
+Typo suggestions are Levenshtein-based for the new command names (`run`,
+`search`, `info`, `cleanup`, `doctor`, `remove`/`rm`/`uninstall`) and flags
+(`--force`, `--as`, `--dry-run`, `--diff`).
 
 ## Recipes
 

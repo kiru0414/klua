@@ -12,6 +12,30 @@ https://gitlab.com/<user>/<repo>/-/raw/<ref>/klua.yaml            (gl)
 parses, it overrides the release heuristics. If it is missing, invalid, or
 comment-only, klua silently falls back to asset scoring.
 
+> **Safer than Homebrew, simpler than Nix, and infinitely hackable in Lua.**
+> A manifest only describes what lives in the isolated store; the v0.4.0 core
+> decides *how* it is exposed: library files stay in the store, PATH conflicts
+> are checked before every symlink, and Lua hooks can refine the policy.
+
+## v0.4.0 manifest integration
+
+- `bins` are passed through the same conflict-safe linker as auto-detected
+  executables. Library-looking names (`.so`, `.so.*`, `.dylib`, `.a`, `.la`,
+  `.dll`) are skipped with a warning and never linked into `~/.local/bin`.
+- `klua install --as NAME` links the **primary** manifest binary as `NAME`;
+  additional `bins` keep their own basenames. `klua install --force` overrides
+  protected-command or PATH-collision guards for the chosen name.
+- `klua run <target> [args...]` executes a manifest binary straight from the
+  store with store libraries on `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`,
+  without creating symlinks.
+- Manage installed manifests with `klua search`, `klua info`, `klua cleanup`,
+  `klua doctor` and `klua remove` (aliases `rm`, `uninstall`). Typos in these
+  names or in flags get Levenshtein suggestions.
+- Custom Lua in `init.lua` can override the provider or command handlers that
+  consume manifests. `klua repair` backs up your `init.lua` to
+  `init.lua.bak.<timestamp>` before restoring the baseline; preview with
+  `klua repair --dry-run` / `--diff`.
+
 Generate a starter in any repo:
 
 ```sh
@@ -84,6 +108,11 @@ bins:
   first, then files under `bin/`, then the shortest path.
 - Raw (non-archive) release assets without `bins` are linked under the
   repo name (`jq-linux-amd64` -> `jq`).
+- Every link is checked against `PATH` and the protected-command list before
+  it is created. A conflict produces a warning, not a failed install: the
+  package stays in the store. Use `--force` to override, or
+  `klua install --as NAME <target>` to choose a different command name for
+  the primary binary.
 
 ## configs
 

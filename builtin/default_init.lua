@@ -21,6 +21,7 @@ klua.commands = klua.commands or {}
 -- Install-time options, consumed by the safe linking helpers below.
 --   force: link even when the name conflicts with a system/protected command
 --   link:  false to stage a package in the store without touching ~/.local/bin
+--   as:    link the primary binary under this name instead of its own basename
 klua.install_opts = klua.install_opts or {}
 
 -- Official registry (hosted on githubusercontent.com via the klua-registry
@@ -219,6 +220,19 @@ local function safe_link(target_path, link_path, name)
 
     if opts.link == false then
         return true -- run-only staging: keep the store isolated
+    end
+
+    -- `klua install --as NAME` renames the first linked binary. Extra binaries
+    -- from the same package keep their own names so they never overwrite each
+    -- other.
+    if opts.as and not opts._as_used then
+        opts._as_used = true
+        name = opts.as
+        link_path = klua.paths.bin .. "/" .. name
+    elseif opts.as and opts._as_used and not opts._as_warned then
+        opts._as_warned = true
+        klua.warn("--as applies to the primary binary only; additional binaries "
+            .. "keep their own names")
     end
 
     if is_library_name(name) then
@@ -1126,21 +1140,43 @@ end
 
 function klua.commands.install(args)
     local force = false
+    local as_name = nil
     local targets = {}
-    for _, arg in ipairs(args) do
+    local index = 1
+    while index <= #args do
+        local arg = args[index]
         if arg == "--force" then
             force = true
+        elseif arg == "--as" then
+            index = index + 1
+            as_name = args[index]
+            if not as_name then
+                klua.error("--as requires a command name")
+                return 1
+            end
         else
             targets[#targets + 1] = arg
         end
+        index = index + 1
     end
     if #targets == 0 then
-        klua.error("usage: klua install [--force] <target> [<target>...]")
+        klua.error("usage: klua install [--force] [--as NAME] <target> [<target>...]")
         return 1
+    end
+    if as_name then
+        if as_name == "" or as_name == "." or as_name == ".."
+            or string.find(as_name, "/") or string.find(as_name, "%c") then
+            klua.error("invalid --as name: '" .. as_name .. "'")
+            return 1
+        end
+        if #targets > 1 then
+            klua.error("--as can only be used with a single target")
+            return 1
+        end
     end
 
     local saved = klua.install_opts
-    klua.install_opts = { force = force, link = true }
+    klua.install_opts = { force = force, link = true, as = as_name }
     local status = 0
     for _, target in ipairs(targets) do
         local code = install_one(target)
