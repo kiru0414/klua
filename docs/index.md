@@ -1,3 +1,5 @@
+[English](index.md) | [日本語](ja/index.md)
+
 ![](asset/logo-1.svg)
 # klua
 

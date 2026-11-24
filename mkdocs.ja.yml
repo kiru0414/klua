@@ -1,0 +1,39 @@
+site_name: klua (日本語)
+site_description: C++20 と Lua で構築された、高速で自己修復可能なパッケージマネージャー
+site_url: https://readthedocs.io
+repo_url: https://github.com/kiru0414/klua
+repo_name: kiru0414/klua
+
+docs_dir: docs/ja
+site_dir: site-ja
+use_directory_urls: false
+
+theme:
+  name: material
+  language: ja
+  logo: asset/logo.svg
+  favicon: asset/logo.svg
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: cyan
+      toggle:
+        icon: material/brightness-7
+        name: ダークモードに切り替え
+    - scheme: slate
+      primary: indigo
+      accent: cyan
+      toggle:
+        icon: material/brightness-4
+        name: ライトモードに切り替え
+  features:
+    - content.code.copy
+    - navigation.sections
+    - search.highlight
+
+nav:
+  - ホーム: index.md
+  - はじめに: getting-started.md
+  - klua.yaml マニフェスト: klua-yaml.md
+  - Lua API リファレンス: lua-api.md
+  - Taps とレジストリ: taps-and-registry.md
