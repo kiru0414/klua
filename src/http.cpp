@@ -2,10 +2,12 @@
 
 #include <httplib.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
+#include <thread>
 
 namespace klua::http {
 
@@ -111,38 +113,55 @@ bool download(const std::string& url, const std::string& dest, std::string& erro
         }
     }
 
-    std::ofstream out{target, std::ios::binary | std::ios::trunc};
-    if (!out) {
-        error = "could not open destination: " + dest;
-        return false;
+    // GitHub's release-asset CDN occasionally answers transient 403/429/5xx
+    // or drops the connection; retry with a short backoff before giving up.
+    constexpr int max_attempts = 4;
+    std::string last_error;
+
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        std::ofstream out{target, std::ios::binary | std::ios::trunc};
+        if (!out) {
+            error = "could not open destination: " + dest;
+            return false;
+        }
+
+        httplib::Client client = make_client(*parsed);
+        const auto result = client.Get(
+            parsed->path, default_headers(),
+            [&](const char* data, size_t length) {
+                out.write(data, static_cast<std::streamsize>(length));
+                return out.good();
+            },
+            nullptr);
+        out.close();
+
+        if (result && result->status == 200) {
+            if (!out) {
+                error = "write failed for " + dest; // local write, not retryable
+                return false;
+            }
+            return true;
+        }
+
+        if (!result) {
+            last_error = httplib::to_string(result.error());
+        } else {
+            last_error = "HTTP " + std::to_string(result->status) + " for " + url;
+        }
+
+        const bool retryable = !result
+            || result->status == 403 || result->status == 429
+            || result->status == 500 || result->status == 502
+            || result->status == 503 || result->status == 504;
+        if (!retryable || attempt == max_attempts) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500 * (1 << (attempt - 1))));
     }
 
-    httplib::Client client = make_client(*parsed);
-    const auto result = client.Get(
-        parsed->path, default_headers(),
-        [&](const char* data, size_t length) {
-            out.write(data, static_cast<std::streamsize>(length));
-            return out.good();
-        },
-        nullptr);
-
-    out.close();
-    if (!result) {
-        fs::remove(target, ec);
-        error = httplib::to_string(result.error());
-        return false;
-    }
-    if (result->status != 200) {
-        fs::remove(target, ec);
-        error = "HTTP " + std::to_string(result->status) + " for " + url;
-        return false;
-    }
-    if (!out) {
-        fs::remove(target, ec);
-        error = "write failed for " + dest;
-        return false;
-    }
-    return true;
+    fs::remove(target, ec);
+    error = last_error;
+    return false;
 }
 
 } // namespace klua::http
