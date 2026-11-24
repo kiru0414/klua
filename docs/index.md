@@ -12,6 +12,12 @@ Packages stay in an isolated per-package store, shared libraries never pollute
 `~/.local/bin`, PATH conflicts are detected before any symlink is created, and
 your `init.lua` can evolve every provider or command without recompiling.
 
+## Install
+```sh
+curl -fsSL https://raw.githubusercontent.com/kiru0414/klua/main/install.sh | bash
+```
+
+
 ## Documentation
 
 - [Getting started](getting-started.md) — installation, XDG paths, CLI, self-healing
