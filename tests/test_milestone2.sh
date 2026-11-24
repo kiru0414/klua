@@ -100,8 +100,8 @@ check "unknown alias is an error" 1 $?
 expect_output "alias miss reported" "not found in any configured registry"
 
 # --- gh: raw binary install (jq) ----------------------------------------------
-run install gh:jqlang/jq
-check "install gh:jqlang/jq exits 0" 0 $?
+run install --force gh:jqlang/jq
+check "install --force gh:jqlang/jq exits 0" 0 $?
 expect_output "asset selected" "jq-linux"
 
 [ -L "$HOME/.local/bin/jq" ]
@@ -144,7 +144,7 @@ check "reinstall via 'i' exits 0" 0 $?
 check "jq still runs after reinstall" 0 $?
 
 # --- pinned tag --------------------------------------------------------------------
-run install gh:jqlang/jq@jq-1.7.1
+run install --force gh:jqlang/jq@jq-1.7.1
 check "pinned tag install exits 0" 0 $?
 [ -d "$HOME/.local/share/klua/store/gh/jqlang/jq/jq-1.7.1" ]
 check "pinned version stored separately" 0 $?
