@@ -30,6 +30,9 @@ your `init.lua` can evolve every provider or command without recompiling.
 - **Automatic PATH conflict protection.** Before linking, klua scans `PATH`,
   warns about existing commands, refuses to shadow protected core commands
   unless `--force` is given, and supports `--as NAME` to avoid collisions.
+- **Verified downloads.** Matching `.sha256`, `.sha256sum` and `checksums.txt`
+  assets are checked before extraction; a mismatch aborts the install unless
+  `--skip-checksum` is explicitly given.
 - **Self-evolving Lua customization.** The embedded baseline is always the
   fallback; your `init.lua` can override providers, command handlers and
   linking policy at runtime. `klua repair` now backs up custom Lua instead of
@@ -37,7 +40,8 @@ your `init.lua` can evolve every provider or command without recompiling.
 
 ## Status
 
-Milestones 1, 2 and 3 plus the v0.4.0 management/safety release are implemented:
+Milestones 1, 2 and 3 plus the v0.4.0 safety release and the v0.5.0
+resolution/verification release are implemented:
 
 **Milestone 1 — core skeleton**
 
@@ -58,16 +62,20 @@ Milestones 1, 2 and 3 plus the v0.4.0 management/safety release are implemented:
 **Milestone 2 — fetcher & installer**
 
 - Native HTTPS client (cpp-httplib + OpenSSL): `klua.http_get`,
-  `klua.download` (streaming, redirect-following).
+  `klua.http_head_redirect`, `klua.download` (streaming, redirect-following),
+  `klua.sha256` (OpenSSL EVP).
 - Archive extraction via system `tar`/`unzip` (`.tar.gz`, `.tar.xz`,
   `.tar.bz2`, `.tar`, `.zip`) with automatic single-top-level-directory
   stripping; POSIX symlinks and `chmod +x` handled natively.
 - Alias sharding: bare targets resolve through `v1/<first_char>.yaml`
   fetched from configured registries / taps and parsed in-memory (yaml-cpp).
-- `gh:user/repo[@tag]`: GitHub Releases API (nlohmann/json), asset scoring
-  by OS/arch, download into the cache, intact extraction into
-  `~/.local/share/klua/store/gh/<user>/<repo>/<version>/`, binary discovery
-  (ELF/Mach-O magic or exec bits), symlink into `~/.local/bin/`.
+- `gh:user/repo[@tag]`: latest tag discovered from the
+  `releases/latest` HTTP redirect, assets parsed from
+  `releases/expanded_assets/<tag>`; the REST API is only a fallback. Asset
+  scoring by OS/arch, download into the cache, checksum verification, intact
+  extraction into `~/.local/share/klua/store/gh/<user>/<repo>/<version>/`,
+  binary discovery (ELF/Mach-O magic or exec bits), symlink into
+  `~/.local/bin/`.
 - `gl:` (GitLab releases) and `url:` (direct download) providers.
 - `klua tap add/remove/list` manages registries in `taps.yaml` (deduplicated).
 - `klua list` enumerates installed packages from the store.
@@ -115,11 +123,30 @@ Milestones 1, 2 and 3 plus the v0.4.0 management/safety release are implemented:
   links.
 - Levenshtein typo hints cover subcommands (`install`, `run`, `search`,
   `info`, `cleanup`, `doctor`, `remove`/`rm`/`uninstall`, …), flags
-  (`--force`, `--as`, `--dry-run`, …) and registry aliases — a mistyped
+  (`--force`, `--as`, `--no-cache`, `--skip-checksum`, `--dry-run`, …) and
+  registry aliases — a mistyped
   `klua serach jq` suggests `search`.
 - `klua repair` is non-destructive by default: it backs up custom Lua to
   `init.lua.bak.<timestamp>` and prints the path; `--dry-run` / `--diff`
   shows the backup path and a unified diff without changing any files.
+
+**v0.5.0 — zero-rate-limit resolution, shard cache & checksums**
+
+- GitHub installs no longer call `api.github.com` first: a HEAD redirect on
+  `https://github.com/<user>/<repo>/releases/latest` yields the tag, and
+  `releases/expanded_assets/<tag>` supplies download links. Pinned tags skip
+  the redirect entirely. The REST API remains a fallback and automatically
+  sends `Authorization: Bearer` when `GITHUB_TOKEN` or `GH_TOKEN` is set.
+- Registry shards are cached under `~/.cache/klua/shards/` for one hour by
+  default (`klua.shard_ttl` in `init.lua`). `--no-cache` forces a refetch;
+  stale cache entries are reused with a warning if the network fails.
+- The selected release asset is hashed with `klua.sha256` and compared with a
+  matching `.sha256`, `.sha256sum` or `checksums.txt` asset before extraction.
+  Mismatches abort with a clear error; `--skip-checksum` explicitly bypasses
+  verification. GitLab releases use the same verification path.
+- `--no-cache` and `--skip-checksum` are accepted by `install`, `run`,
+  `search`, `info`, `cleanup`, `doctor`, `sync`, `upgrade` and `remove`, and
+  are covered by Levenshtein typo hints.
 
 See `AGENTS.md` for the full roadmap.
 
@@ -131,6 +158,7 @@ bash tests/test_milestone2.sh   # network: taps, alias sharding, real installs
 bash tests/test_milestone3.sh   # add/sync/upgrade + local manifest & build tests
 bash tests/test_ux.sh           # remove, CLI/alias typo suggestions
 bash tests/test_v04.sh          # offline: conflict safety, run, management, repair
+bash tests/test_v05.sh          # offline: API-free GitHub, shard cache, SHA-256
 ```
 
 ## Building (Linux / macOS)
@@ -160,6 +188,8 @@ klua install gh:jqlang/jq     # direct GitHub Releases install
 klua i gh:jqlang/jq@jq-1.7.1  # pinned tag
 klua install --force git      # override shadowing/protected-command guard
 klua install --as jq2 jq      # link the primary binary as ~/.local/bin/jq2
+klua install --no-cache fd    # refetch the registry shard instead of using cache
+klua install --skip-checksum jq  # bypass SHA-256 verification (explicit)
 klua run jq --version         # execute from the store, no global symlink
 klua search jq                # search alias shards across all registries
 klua info jq                  # resolution, versions, links, release metadata
@@ -185,7 +215,7 @@ klua repair --dry-run         # preview backup path and diff, change nothing
 | Config  | `~/.config/klua/` (`init.lua`, `packages.yaml`, `taps.yaml`) |
 | Store   | `~/.local/share/klua/store/<provider>/<user>/<repo>/<version>/` |
 | Bin     | `~/.local/bin/` (symlinks into the store)       |
-| Cache   | `~/.cache/klua/`                                |
+| Cache   | `~/.cache/klua/` (`downloads/`, `checksums/`, `build/`, `shards/`) |
 
 Libraries are never linked into `~/.local/bin/`; they stay inside the store
 and are exposed to `klua run` via `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`.
@@ -207,9 +237,12 @@ end)
 Native primitives available to Lua: `klua.info/warn/error`,
 `klua.file_exists/is_dir/is_executable/read_file/write_file/mkdir/copy/remove/list_dir`,
 `klua.find_executables`, `klua.readlink`, `klua.env`, `klua.exec`,
-`klua.register_provider`, `klua.http_get/download`, `klua.extract/is_archive`,
-`klua.symlink`, `klua.chmod_exec`, `klua.json_parse/yaml_parse`,
-`klua.platform`, `klua.paths`, `klua.version`. Set `klua.install_opts =
+`klua.register_provider`, `klua.http_get/http_head_redirect/download`,
+`klua.sha256`, `klua.extract/is_archive`, `klua.symlink`, `klua.chmod_exec`,
+`klua.json_parse/yaml_parse`, `klua.platform`, `klua.paths`, `klua.version`.
+Set `klua.shard_ttl` to change the one-hour cache lifetime and
+`klua.cli_flags` to inspect `--no-cache` / `--skip-checksum` from your own
+handlers. Set `klua.install_opts =
 { force = ..., link = ..., as = ... }` in a custom handler to control conflict
 overrides, rename the primary link, or request a store-only (run-only)
 install. This is the "self-evolving" part: rebind `klua.commands.<name>` or

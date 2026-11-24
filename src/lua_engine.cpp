@@ -1,6 +1,7 @@
 #include "lua_engine.hpp"
 
 #include "archive.hpp"
+#include "crypto.hpp"
 #include "fsops.hpp"
 #include "http.hpp"
 #include "klua/embedded_assets.hpp"
@@ -81,6 +82,7 @@ void LuaEngine::bind_natives() {
     paths_table["store"] = paths::store_dir().string();
     paths_table["bin"] = paths::bin_dir().string();
     paths_table["cache"] = paths::cache_dir().string();
+    paths_table["shards"] = paths::shards_dir().string();
     paths_table["init"] = paths::user_init().string();
     paths_table["packages"] = paths::packages_file().string();
     paths_table["taps"] = paths::taps_file().string();
@@ -183,6 +185,18 @@ void LuaEngine::bind_natives() {
                        return {response.body, response.status, sol::nullopt};
                    });
 
+    // HEAD without following redirects: returns (location, status, err).
+    // Used for API-free GitHub "latest release" tag discovery.
+    k.set_function("http_head_redirect",
+                   [](const std::string& url)
+                       -> std::tuple<std::string, long, sol::optional<std::string>> {
+                       const http::HeadResponse response = http::head_redirect(url);
+                       if (!response.error.empty()) {
+                           return {std::string{}, 0L, response.error};
+                       }
+                       return {response.location, response.status, sol::nullopt};
+                   });
+
     // Streaming download: returns (ok, err).
     k.set_function("download",
                    [](const std::string& url, const std::string& dest)
@@ -192,6 +206,18 @@ void LuaEngine::bind_natives() {
                            return {true, sol::nullopt};
                        }
                        return {false, error};
+                   });
+
+    // SHA-256 of a local file: returns (digest, err). Uses OpenSSL EVP.
+    k.set_function("sha256",
+                   [](const std::string& path)
+                       -> std::tuple<std::string, sol::optional<std::string>> {
+                       std::string error;
+                       const std::string digest = crypto::sha256_file(path, error);
+                       if (!error.empty()) {
+                           return {std::string{}, error};
+                       }
+                       return {digest, sol::nullopt};
                    });
 
     // Archive extraction with single-top-level-directory stripping.
@@ -370,6 +396,12 @@ int LuaEngine::run_command(const std::string& name, const std::vector<std::strin
         return ret.as<int>();
     }
     return 0;
+}
+
+void LuaEngine::set_cli_flags(bool no_cache, bool skip_checksum) {
+    sol::table flags = lua_["klua"]["cli_flags"].get_or_create<sol::table>();
+    flags["no_cache"] = no_cache;
+    flags["skip_checksum"] = skip_checksum;
 }
 
 } // namespace klua

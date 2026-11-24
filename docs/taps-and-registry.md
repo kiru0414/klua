@@ -30,6 +30,24 @@ Details:
   to the official registry). Duplicates removed, trailing slashes stripped.
 - Resolution is recursive: an alias may map to another bare alias.
 
+## Shard cache
+
+Successful `v1/<char>.yaml` responses are cached under
+`~/.cache/klua/shards/` (`$XDG_CACHE_HOME/klua/shards` when set). A sibling
+`.ts` file records the fetch time; entries younger than `klua.shard_ttl`
+(default one hour) are reused without contacting the registry, so repeated
+installs and `klua search` runs are instant.
+
+```sh
+klua install --no-cache fd   # refetch v1/f.yaml now
+klua search --no-cache fd    # bypass cache for all 27 shards
+```
+
+If a refresh fails, a stale cached body is used with a warning. Set
+`klua.shard_ttl = 0` in `~/.config/klua/init.lua` to disable reuse entirely.
+Only HTTP 200 responses are cached; 404s and invalid YAML still fall through
+to the next registry.
+
 ## Shard format
 
 `v1/f.yaml`:

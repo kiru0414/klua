@@ -3,6 +3,7 @@
 #include <httplib.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -58,7 +59,7 @@ std::optional<Url> parse_url(const std::string& url) {
     return parsed;
 }
 
-httplib::Client make_client(const Url& url) {
+httplib::Client make_client(const Url& url, bool follow_redirects = true) {
     std::string base = url.scheme + "://" + url.host;
     if (url.port > 0) {
         base += ":" + std::to_string(url.port);
@@ -67,12 +68,49 @@ httplib::Client make_client(const Url& url) {
     client.set_connection_timeout(30, 0);
     client.set_read_timeout(300, 0);
     client.set_write_timeout(120, 0);
-    client.set_follow_location(true);
+    client.set_follow_location(follow_redirects);
     return client;
 }
 
-httplib::Headers default_headers() {
-    return httplib::Headers{{"User-Agent", std::string{"klua/"} + KLUA_VERSION}};
+std::string env_or_empty(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr ? std::string{value} : std::string{};
+}
+
+std::string github_token() {
+    for (const char* name : {"GITHUB_TOKEN", "GH_TOKEN"}) {
+        const std::string value = env_or_empty(name);
+        if (!value.empty()) {
+            return value;
+        }
+    }
+    return {};
+}
+
+// Tokens are sent only to GitHub's API by default. A user who points
+// klua.github_api at a trusted mirror can opt in with KLUA_GITHUB_API_HOST
+// (useful for GitHub Enterprise and offline test servers). For a custom host
+// the token is limited to API-looking paths, not raw files or downloads.
+bool token_allowed(const Url& url) {
+    if (url.host == "api.github.com") {
+        return true;
+    }
+    const std::string override = env_or_empty("KLUA_GITHUB_API_HOST");
+    if (override.empty() || url.host != override) {
+        return false;
+    }
+    return url.path.find("/api/") == 0 || url.path.find("/repos/") != std::string::npos;
+}
+
+httplib::Headers default_headers(const Url& url) {
+    httplib::Headers headers{{"User-Agent", std::string{"klua/"} + KLUA_VERSION}};
+    if (token_allowed(url)) {
+        const std::string token = github_token();
+        if (!token.empty()) {
+            headers.emplace("Authorization", "Bearer " + token);
+        }
+    }
+    return headers;
 }
 
 } // namespace
@@ -86,7 +124,7 @@ Response get(const std::string& url) {
     }
 
     httplib::Client client = make_client(*parsed);
-    const auto result = client.Get(parsed->path, default_headers());
+    const auto result = client.Get(parsed->path, default_headers(*parsed));
     if (!result) {
         response.error = httplib::to_string(result.error());
         return response;
@@ -94,6 +132,26 @@ Response get(const std::string& url) {
     response.status = result->status;
     response.body = std::move(result->body);
     return response;
+}
+
+HeadResponse head_redirect(const std::string& url) {
+    HeadResponse result;
+    const auto parsed = parse_url(url);
+    if (!parsed) {
+        result.error = "invalid URL: " + url;
+        return result;
+    }
+
+    httplib::Client client = make_client(*parsed, /*follow_redirects=*/false);
+    const auto response = client.Head(parsed->path, default_headers(*parsed));
+    if (!response) {
+        result.error = httplib::to_string(response.error());
+        return result;
+    }
+
+    result.status = response->status;
+    result.location = response->get_header_value("Location");
+    return result;
 }
 
 bool download(const std::string& url, const std::string& dest, std::string& error) {
@@ -127,7 +185,7 @@ bool download(const std::string& url, const std::string& dest, std::string& erro
 
         httplib::Client client = make_client(*parsed);
         const auto result = client.Get(
-            parsed->path, default_headers(),
+            parsed->path, default_headers(*parsed),
             [&](const char* data, size_t length) {
                 out.write(data, static_cast<std::streamsize>(length));
                 return out.good();

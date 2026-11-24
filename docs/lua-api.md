@@ -30,17 +30,21 @@ primitives below.
 - Rebind `klua.commands.run`, `klua.commands.search`, `klua.commands.info`,
   `klua.commands.cleanup`, `klua.commands.doctor` or `klua.commands.remove`
   just like any other handler — no rebuild required.
+- `gh:` resolution is API-free by default and verified checksums gate
+  extraction; both policies live in the baseline Lua and can be replaced.
 
 ## Globals
 
 | Name | Type | Meaning |
 | ---- | ---- | ------- |
-| `klua.version` | string | klua version, e.g. `"0.4.0"` |
-| `klua.paths` | table | `config`, `store`, `bin`, `cache`, `init`, `packages`, `taps` (absolute path strings) |
+| `klua.version` | string | klua version, e.g. `"0.5.0"` |
+| `klua.paths` | table | `config`, `store`, `bin`, `cache`, `shards`, `init`, `packages`, `taps` (absolute path strings) |
 | `klua.providers` | table | scheme -> `function(rest, target)` |
 | `klua.commands` | table | command name -> `function(args)` returning an exit code |
 | `klua.install_opts` | table | install-time flags: `force` (override link guards), `link` (`false` = store-only install), `as` (primary link name from `--as`) |
 | `klua.registries` | array | registry base URLs for alias sharding (defaults to the official registry) |
+| `klua.shard_ttl` | number | registry shard cache lifetime in seconds (default `3600`); `0` disables reuse |
+| `klua.cli_flags` | table | `no_cache` / `skip_checksum`, published from CLI switches before dispatch |
 
 ### Service endpoint overrides
 
@@ -51,9 +55,15 @@ klua.github_api   = "https://api.github.com"          -- Releases API base
 klua.gitlab_api   = "https://gitlab.com/api/v4"       -- Releases API base
 klua.raw_github   = "https://raw.githubusercontent.com"  -- klua.yaml fetch base
 klua.raw_gitlab   = "https://gitlab.com"                 -- klua.yaml fetch base
+klua.github_web   = "https://github.com"              -- web release redirect/assets
 klua.github_clone = "https://github.com"              -- git clone base (build.steps)
 klua.gitlab_clone = "https://gitlab.com"              -- git clone base (build.steps)
 ```
+
+`GITHUB_TOKEN` / `GH_TOKEN` are added as `Authorization: Bearer` headers when
+the REST fallback talks to `api.github.com`. Set `KLUA_GITHUB_API_HOST` to a
+trusted custom hostname to enable the same header for API paths on that host
+(raw files and downloads never receive it).
 
 ## Logging
 
@@ -102,18 +112,50 @@ local body, status, err = klua.http_get("https://api.github.com/...")
 -- err ~= nil  -> transport failure (status 0, body "")
 -- err == nil  -> status is the HTTP code; body is the response text
 
+local location, status, err = klua.http_head_redirect(
+    "https://github.com/user/repo/releases/latest")
+-- HEAD without following redirects; Location may be "" on 200/404
+
 local ok, err = klua.download("https://host/tool.tar.gz", "/path/dest")
 ```
 
-- HTTPS via OpenSSL; redirects followed across hosts.
-- Sends `User-Agent: klua/<version>`. No custom-header parameter — see
-  the private-auth recipe below for authenticated requests.
+- HTTPS via OpenSSL; `http_get` and `download` follow redirects across hosts.
+- `http_head_redirect` does **not** follow redirects and returns the raw
+  `Location` header, used by the baseline for API-free tag discovery.
+- Sends `User-Agent: klua/<version>`. Requests to `api.github.com` also send
+  `Authorization: Bearer <token>` when `GITHUB_TOKEN` or `GH_TOKEN` is set.
 - `download` streams to disk, creates parent dirs, accepts only HTTP 200,
   and removes partial files on failure.
 - Transient failures (`403`, `429`, `5xx`, dropped connections — common with
   GitHub's release-asset CDN) are retried up to 4 times with exponential
   backoff.
 - Timeouts: 30 s connect, 300 s read, 120 s write.
+
+## SHA-256
+
+```lua
+local digest, err = klua.sha256("/path/to/archive.tar.gz")
+-- digest: lowercase 64-character hex on success; "" plus err on failure
+```
+
+Implemented with OpenSSL `EVP_Digest`. The baseline calls it on the
+downloaded payload before extraction when the release contains
+`<asset>.sha256`, `<asset>.sha256sum` or `checksums.txt`. It accepts
+`<hash>  <filename>`, `<hash> *<filename>`, BSD-style
+`SHA256(<filename>) = <hash>`, and bare digests in asset-specific sidecars.
+A mismatch produces `SHA-256 mismatch for <asset>` and an exit code of `1`
+before any store files are written. `klua.cli_flags.skip_checksum` (from
+`--skip-checksum`) bypasses verification with a warning.
+
+## Registry shard cache
+
+`resolve_alias` and `klua.commands.search` share a local cache under
+`klua.paths.shards`. Each URL is hashed to a stable filename; a sibling `.ts`
+file stores the fetch time. Entries younger than `klua.shard_ttl` (default
+3600 seconds) are reused without a network request. `--no-cache` sets
+`klua.cli_flags.no_cache = true` and forces a refetch; if the refetch fails,
+a stale entry is reused with a warning. Returned bodies are always parsed
+with `klua.yaml_parse`.
 
 ## Archives
 
@@ -166,7 +208,9 @@ The CLI dispatches `klua.commands.<name>(args)` where `args` is an array
 of positional strings. Names: `install`, `run`, `search`, `info`, `cleanup`,
 `doctor`, `add`, `remove`, `sync`, `upgrade`, `tap`, `list`, `init-manifest`
 (note the dash: `klua.commands["init-manifest"]`). `run` receives the target
-plus all pass-through arguments. Return a process exit code. Override or
+plus all pass-through arguments. CLI-wide switches (`--no-cache`,
+`--skip-checksum`) are consumed by CLI11 and exposed as `klua.cli_flags`;
+they are not passed in `args`. Return a process exit code. Override or
 wrap freely:
 
 ```lua
@@ -236,7 +280,7 @@ is implemented natively so it works even when Lua is broken:
 
 Typo suggestions are Levenshtein-based for the new command names (`run`,
 `search`, `info`, `cleanup`, `doctor`, `remove`/`rm`/`uninstall`) and flags
-(`--force`, `--as`, `--dry-run`, `--diff`).
+(`--force`, `--as`, `--no-cache`, `--skip-checksum`, `--dry-run`, `--diff`).
 
 ## Recipes
 
@@ -262,35 +306,25 @@ end)
 -- klua install corp:mytool
 ```
 
-### Private GitHub auth (wrap http_get)
+### GitHub token fallback
 
-`klua.http_get` sends no auth headers. Monkey-patch it to route GitHub
-API calls through `curl` with a token, keeping all default provider logic:
+The native HTTP client already adds `Authorization: Bearer <token>` for
+`api.github.com` when `GITHUB_TOKEN` (preferred) or `GH_TOKEN` is set, so no
+monkey-patching is needed for private REST fallbacks. Since normal installs
+resolve through GitHub's web endpoints, the token is only used when that
+discovery path fails.
 
-```lua
-local native_http_get = klua.http_get
-klua.http_get = function(url)
-    if not url:match("^https://api%.github%.com/") then
-        return native_http_get(url)
-    end
-    local token = klua.env("GITHUB_TOKEN")
-    if not token or token == "" then return native_http_get(url) end
-    local body_file = klua.paths.cache .. "/http-body"
-    local code_file = klua.paths.cache .. "/http-code"
-    local cmd = "curl -sS -H 'Authorization: Bearer " .. token .. "'"
-        .. " -o '" .. body_file .. "' -w '%{http_code}' '" .. url .. "'"
-        .. " > '" .. code_file .. "'"
-    if klua.exec(cmd) ~= 0 then
-        return "", 0, "curl failed"
-    end
-    local status = tonumber(klua.read_file(code_file) or "") or 0
-    return klua.read_file(body_file) or "", status, nil
-end
+For a custom host, set both the endpoint override and
+`KLUA_GITHUB_API_HOST` in the environment:
+
+```sh
+export GH_TOKEN=ghp_...
+export KLUA_GITHUB_API_HOST=github.corp.example
 ```
 
-(Keep the token out of shell history/logs; it is passed via argv here —
-for stricter setups write a curl config file with `klua.write_file` and
-use `curl --config`.)
+If a different auth scheme is required, wrap `klua.http_get` as before — but
+remember that web discovery uses `klua.http_head_redirect`, so wrap that too
+if the token must be present on the redirect request.
 
 ### Custom source build without a manifest
 
@@ -322,6 +356,7 @@ no user config needed.
 
 ```lua
 klua.github_api   = "https://github.corp.example/api/v3"
+klua.github_web   = "https://github.corp.example"  -- releases/latest + expanded_assets
 klua.raw_github   = "https://github.corp.example/raw"
 klua.github_clone = "https://github.corp.example"
 ```

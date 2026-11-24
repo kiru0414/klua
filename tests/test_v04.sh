@@ -154,7 +154,7 @@ export PATH="$HOME/.local/bin:$FAKEBIN:$PATH"
 # --- version -----------------------------------------------------------------
 run --version
 check "--version exits 0" 0 $?
-expect_output "version is 0.4.0" "klua 0.4.0"
+expect_output "version is 0.5.0" "klua 0.5.0"
 
 # --- CLI typo suggestions include new commands --------------------------------
 run serach tool
@@ -214,7 +214,7 @@ exists "run leaves ~/.local/bin untouched" $?
 run run runner --version
 check "run forwards flags after target" 0 $?
 expect_output "flag passed through" "args=--version"
-expect_absent "flag not swallowed by klua" "klua 0.4.0"
+expect_absent "flag not swallowed by klua" "klua 0.5.0"
 
 run run runner again
 check "run on installed package exits 0" 0 $?
@@ -287,7 +287,7 @@ exists "download cache cleared" $?
 # --- doctor ---------------------------------------------------------------------
 run doctor
 check "doctor exits 0 with only warnings" 0 $?
-expect_output "doctor reports version" "klua 0.4.0"
+expect_output "doctor reports version" "klua 0.5.0"
 expect_output "doctor checks store" "\[ok\]   store:"
 expect_output "doctor checks registry" "registry: http://127.0.0.1:$PORT"
 expect_output "doctor summary" "doctor:"

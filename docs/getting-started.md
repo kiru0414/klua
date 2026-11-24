@@ -19,8 +19,8 @@ Static Linux binaries (x86_64, arm64) and macOS binaries are attached to
 every `v*` release:
 
 ```sh
-curl -LO https://github.com/kiru0414/klua/releases/latest/download/klua-v0.4.0-linux-x86_64.tar.gz
-tar -xzf klua-v0.4.0-linux-x86_64.tar.gz
+curl -LO https://github.com/kiru0414/klua/releases/latest/download/klua-v0.5.0-linux-x86_64.tar.gz
+tar -xzf klua-v0.5.0-linux-x86_64.tar.gz
 install -m 755 klua ~/.local/bin/klua   # or /usr/local/bin
 klua --version
 ```
@@ -64,7 +64,7 @@ On Windows, build inside WSL — POSIX is the only supported target.
 | Config  | `~/.config/klua/` (`init.lua`, `packages.yaml`, `taps.yaml`) | `XDG_CONFIG_HOME` |
 | Store   | `~/.local/share/klua/store/<provider>/<user>/<repo>/<version>/` | `XDG_DATA_HOME` |
 | Bin     | `~/.local/bin/<name>` (symlinks into the store) | none (always `~/.local/bin`) |
-| Cache   | `~/.cache/klua/` (`downloads/`, `build/`) | `XDG_CACHE_HOME` |
+| Cache   | `~/.cache/klua/` (`downloads/`, `checksums/`, `build/`, `shards/`) | `XDG_CACHE_HOME` |
 
 Overrides are honored only when absolute. Archives are extracted intact
 into the store (single top-level wrapper directories are stripped), so
@@ -85,16 +85,16 @@ relative layouts of complex tools survive.
 ## CLI
 
 ```
-klua install [--force] [--as NAME] <target>...   (alias: klua i)
-klua run <target> [--] [args...]     # store-only execution, no symlink
-klua search <query>
-klua info <target>
-klua cleanup
-klua doctor
+klua install [--force] [--as NAME] [--no-cache] [--skip-checksum] <target>...  (alias: klua i)
+klua run [--no-cache] [--skip-checksum] <target> [--] [args...]  # store-only
+klua search [--no-cache] <query>
+klua info [--no-cache] <target>
+klua cleanup [--no-cache]
+klua doctor [--no-cache]
 klua add <target>...
-klua remove <target>...    (aliases: klua rm, klua uninstall)
-klua sync [path_or_url]
-klua upgrade [target...]
+klua remove [--no-cache] <target>...    (aliases: klua rm, klua uninstall)
+klua sync [--no-cache] [--skip-checksum] [path_or_url]
+klua upgrade [--no-cache] [--skip-checksum] [target...]
 klua tap <add|remove|list> [url]
 klua list
 klua repair [--dry-run|--diff]
@@ -105,7 +105,7 @@ klua --version | --help
 Mistyped subcommands, flags, and aliases get a Levenshtein-based hint. The
 suggestion dictionary includes `install`, `run`, `search`, `info`, `cleanup`,
 `doctor`, `remove`/`rm`/`uninstall`, and flags such as `--force`, `--as`,
-`--dry-run` and `--diff`:
+`--no-cache`, `--skip-checksum`, `--dry-run` and `--diff`:
 
 ```
 $ klua instll
@@ -132,10 +132,58 @@ klua install fd                  # alias -> v1/f.yaml -> gh:sharkdp/fd
 
 Pipeline: direct scheme dispatch, or alias sharding lookup, then (for
 gh/gl) an in-repo [`klua.yaml`](klua-yaml.md) manifest check, then release
-asset scoring by OS/arch, download, extraction into the store, binary
-discovery (ELF/Mach-O magic or exec bits), `chmod +x`, conflict-checked
-symlink into `~/.local/bin`. See [taps-and-registry.md](taps-and-registry.md)
-for alias resolution.
+discovery (API-free for `gh:`), asset scoring by OS/arch, download, SHA-256
+verification, extraction into the store, binary discovery (ELF/Mach-O magic
+or exec bits), `chmod +x`, conflict-checked symlink into `~/.local/bin`. See
+[taps-and-registry.md](taps-and-registry.md) for alias resolution and the
+sections below for release discovery, caching and checksums.
+
+### API-free GitHub resolution
+
+`gh:user/repo` never calls `api.github.com` first. klua sends a HEAD request
+to `https://github.com/<user>/<repo>/releases/latest` and reads the
+`Location` redirect to learn the tag, then fetches
+`releases/expanded_assets/<tag>` and parses `href` links whose paths contain
+`/<user>/<repo>/releases/download/<tag>/...`. A pinned target
+(`gh:user/repo@v1.2.3`) skips the redirect and reads that tag's asset page
+directly. This avoids the unauthenticated REST limit entirely.
+
+The REST API is still used if the web endpoints fail. When the fallback runs,
+`GITHUB_TOKEN` or `GH_TOKEN` (in that order) is sent automatically as
+`Authorization: Bearer ...`. For a trusted custom API host, set
+`KLUA_GITHUB_API_HOST` to that hostname; the token is then limited to
+API-looking paths on that host.
+
+### Registry shard cache
+
+Fetched `v1/<char>.yaml` shards are stored under `~/.cache/klua/shards/` with
+a one-hour TTL (`klua.shard_ttl` in `init.lua`). Repeated installs and
+`klua search` runs reuse the cached body. `--no-cache` forces a fresh fetch;
+if a refresh fails, a stale entry is reused with a warning so you can still
+work offline.
+
+```sh
+klua install --no-cache fd   # bypass the shard cache for this invocation
+klua search --no-cache fd    # same for search (all 27 shards)
+```
+
+### SHA-256 verification
+
+When a release ships `<asset>.sha256`, `<asset>.sha256sum` or
+`checksums.txt`, klua hashes the downloaded file with OpenSSL EVP and checks
+the digest **before** extraction. Supported checksum lines include
+`<hash>  <filename>`, `<hash> *<filename>` and `SHA256(<filename>) = <hash>`;
+a bare 64-hex digest is accepted in an asset-specific sidecar. A mismatch
+aborts the install and leaves the store untouched.
+
+```sh
+klua install gh:jqlang/jq               # verifies automatically if a checksum exists
+klua install --skip-checksum gh:jqlang/jq  # explicit bypass, warns and continues
+```
+
+GitLab releases go through the same verification path. Registries and
+checksum files themselves are not signed; this protects against truncated or
+corrupted downloads, not maliciously published checksums.
 
 ### Conflict safety
 

@@ -12,7 +12,8 @@
 --   klua.read_file / klua.write_file / klua.mkdir
 --   klua.copy / klua.remove / klua.list_dir / klua.find_executables
 --   klua.readlink / klua.env / klua.exec / klua.register_provider
---   klua.http_get / klua.download / klua.extract / klua.is_archive
+--   klua.http_get / klua.http_head_redirect / klua.download
+--   klua.sha256 / klua.extract / klua.is_archive
 --   klua.symlink / klua.chmod_exec / klua.json_parse / klua.yaml_parse
 
 klua.providers = klua.providers or {}
@@ -38,6 +39,13 @@ klua.raw_github = klua.raw_github or "https://raw.githubusercontent.com"
 klua.raw_gitlab = klua.raw_gitlab or "https://gitlab.com"
 klua.github_clone = klua.github_clone or "https://github.com"
 klua.gitlab_clone = klua.gitlab_clone or "https://gitlab.com"
+-- Web endpoints used for API-free release discovery (overridable in tests).
+klua.github_web = klua.github_web or "https://github.com"
+
+-- Registry shard cache: one-hour TTL by default. Set klua.shard_ttl in
+-- init.lua to change it, or pass --no-cache to force a fresh fetch.
+klua.shard_ttl = klua.shard_ttl or 3600
+klua.cli_flags = klua.cli_flags or {}
 
 -- ---------------------------------------------------------------------------
 -- Small helpers
@@ -338,6 +346,52 @@ local function all_registries()
 end
 
 -- ---------------------------------------------------------------------------
+-- Registry shard cache
+--
+-- Shards are stored under ~/.cache/klua/shards/ with a content-independent
+-- key derived from the URL. A sibling .ts file records the fetch time so
+-- repeated installs/search calls stay instant within klua.shard_ttl.
+-- ---------------------------------------------------------------------------
+
+local function shard_cache_key(url)
+    local hash = 0xcbf29ce484222325
+    for index = 1, #url do
+        hash = hash ~ string.byte(url, index)
+        hash = (hash * 0x100000001b3) & 0xffffffffffffffff
+    end
+    return string.format("%016x", hash)
+end
+
+local function fetch_shard(url)
+    local flags = klua.cli_flags or {}
+    local key = shard_cache_key(url)
+    local path = klua.paths.shards .. "/" .. key .. ".yaml"
+    local stamp_path = path .. ".ts"
+
+    local cached_body = klua.read_file(path)
+    local cached_stamp = tonumber(klua.read_file(stamp_path) or "")
+    if cached_body and cached_stamp and not flags.no_cache then
+        if os.time() - cached_stamp < klua.shard_ttl then
+            return cached_body
+        end
+    end
+
+    local body, status, err = klua.http_get(url)
+    if not err and status == 200 then
+        klua.write_file(path, body)
+        klua.write_file(stamp_path, tostring(os.time()))
+        return body
+    end
+
+    if cached_body and not flags.no_cache then
+        klua.warn("using stale cached shard for " .. url
+            .. " (" .. tostring(err or ("HTTP " .. tostring(status))) .. ")")
+        return cached_body
+    end
+    return nil, err or ("HTTP " .. tostring(status))
+end
+
+-- ---------------------------------------------------------------------------
 -- Alias sharding lookup: fetch v1/<first_char>.yaml from each registry and
 -- resolve the alias to a scheme target. Non-alpha first characters map to
 -- the "_" shard.
@@ -362,8 +416,8 @@ local function resolve_alias(target)
     local candidates, seen = {}, {}
     for _, base in ipairs(registries) do
         local url = strip_trailing_slash(base) .. "/v1/" .. shard .. ".yaml"
-        local body, status, err = klua.http_get(url)
-        if not err and status == 200 then
+        local body, err = fetch_shard(url)
+        if body then
             local doc, parse_err = klua.yaml_parse(body)
             if doc and type(doc) == "table" then
                 for key in pairs(doc) do
@@ -379,6 +433,8 @@ local function resolve_alias(target)
             elseif parse_err then
                 klua.warn("registry " .. base .. " returned invalid YAML: " .. parse_err)
             end
+        elseif err then
+            klua.warn("could not fetch shard " .. url .. ": " .. err)
         end
     end
     return nil, "alias '" .. target .. "' not found in any configured registry", candidates
@@ -502,6 +558,200 @@ local function select_asset(assets, manifest, platform)
         end
     end
     return best
+end
+
+-- ---------------------------------------------------------------------------
+-- API-free GitHub release discovery
+--
+-- `https://github.com/<user>/<repo>/releases/latest` redirects to the tag
+-- page; HEAD exposes that tag without a REST call. GitHub's
+-- `releases/expanded_assets/<tag>` fragment then lists every downloadable
+-- asset as an ordinary HTML link. The REST API remains a fallback for repos
+-- whose web layout changes or when GITHUB_TOKEN is available.
+-- ---------------------------------------------------------------------------
+
+local function html_unescape(value)
+    value = string.gsub(value, "&amp;", "&")
+    value = string.gsub(value, "&quot;", "\"")
+    value = string.gsub(value, "&#39;", "'")
+    return value
+end
+
+local function absolute_url(base, href)
+    href = html_unescape(href)
+    if string.match(href, "^https?://") then
+        return href
+    end
+    local origin = string.match(base, "^(%w+://[^/]+)")
+    if string.sub(href, 1, 1) == "/" then
+        return (origin or "") .. href
+    end
+    local prefix = string.match(base, "^(.*/)[^/]*$") or ((origin or base) .. "/")
+    return prefix .. href
+end
+
+local function tag_from_location(location)
+    local tag = string.match(location or "", "/releases/tag/([^?#]+)")
+    if tag then
+        tag = string.gsub(tag, "/+$", "")
+        if tag ~= "" then
+            return tag
+        end
+    end
+    return nil
+end
+
+local function github_web_release(user, name, tag)
+    local web = strip_trailing_slash(klua.github_web)
+
+    if not tag then
+        local latest = web .. "/" .. user .. "/" .. name .. "/releases/latest"
+        local location, status, err = klua.http_head_redirect(latest)
+        if err then
+            return nil, "HEAD " .. latest .. " failed: " .. err
+        end
+        tag = tag_from_location(location)
+        if not tag then
+            return nil, "could not determine latest tag from " .. latest
+                .. " (HTTP " .. tostring(status) .. ", Location: " .. tostring(location) .. ")"
+        end
+    end
+
+    local url = web .. "/" .. user .. "/" .. name .. "/releases/expanded_assets/" .. tag
+    local body, status, err = klua.http_get(url)
+    if err or status ~= 200 then
+        return nil, "could not fetch " .. url .. ": "
+            .. tostring(err or ("HTTP " .. tostring(status)))
+    end
+
+    local assets, seen = {}, {}
+    for href in string.gmatch(body, [=[href=["']([^"']+)["']]=]) do
+        local path = string.match(html_unescape(href), "^([^?#]+)")
+        local asset_name = path and string.match(path, "/releases/download/[^/]+/([^/]+)$")
+        if asset_name and asset_name ~= "" and not seen[asset_name] then
+            seen[asset_name] = true
+            assets[#assets + 1] = {
+                name = asset_name,
+                browser_download_url = absolute_url(web, path),
+            }
+        end
+    end
+    if #assets == 0 then
+        return nil, "no downloadable assets found at " .. url
+    end
+    return { tag_name = tag, assets = assets }
+end
+
+-- ---------------------------------------------------------------------------
+-- SHA-256 verification
+--
+-- A release may ship <asset>.sha256, <asset>.sha256sum or checksums.txt. The
+-- digest is checked before extraction; a mismatch aborts the install unless
+-- --skip-checksum was passed.
+-- ---------------------------------------------------------------------------
+
+local function checksum_candidates(assets, asset_name)
+    local wanted = {
+        asset_name .. ".sha256",
+        asset_name .. ".sha256sum",
+        "checksums.txt",
+    }
+    local found = {}
+    for _, name in ipairs(wanted) do
+        for _, asset in ipairs(assets or {}) do
+            if (asset.name or "") == name then
+                found[#found + 1] = asset
+                break
+            end
+        end
+    end
+    return found
+end
+
+local function parse_checksum_text(text, asset_name, allow_bare)
+    local target = string.lower(asset_name)
+    for line in string.gmatch(text or "", "[^\r\n]+") do
+        local hash, name = string.match(line, "^%s*([%xX]+)%s+[*]?([^%s]+)")
+        if hash and #hash == 64 then
+            local file_name = string.match(name, "([^/]+)$") or name
+            if string.lower(file_name) == target then
+                return string.lower(hash)
+            end
+        end
+
+        local bsd_name, bsd_hash = string.match(
+            line, "^%s*SHA%d*%s*%(%s*([^)]+)%s*%)%s*=%s*([%xX]+)")
+        if bsd_hash and #bsd_hash == 64 then
+            local file_name = string.match(bsd_name, "([^/]+)$") or bsd_name
+            if string.lower(file_name) == target then
+                return string.lower(bsd_hash)
+            end
+        end
+
+        if allow_bare then
+            local bare = string.match(line, "^%s*([%xX]+)%s*$")
+            if bare and #bare == 64 then
+                return string.lower(bare)
+            end
+        end
+    end
+    return nil
+end
+
+local function verify_checksum(payload_path, asset_name, assets, label)
+    local candidates = checksum_candidates(assets, asset_name)
+    if #candidates == 0 then
+        return 0
+    end
+
+    local flags = klua.cli_flags or {}
+    if flags.skip_checksum then
+        klua.warn("checksum verification skipped via --skip-checksum for " .. asset_name)
+        return 0
+    end
+
+    local actual, digest_err = klua.sha256(payload_path)
+    if not actual or digest_err then
+        klua.error("could not compute SHA-256 for " .. asset_name .. ": "
+            .. tostring(digest_err))
+        return 1
+    end
+    actual = string.lower(actual)
+
+    local checked = false
+    for _, checksum_asset in ipairs(candidates) do
+        local url = checksum_asset.browser_download_url
+        if url then
+            local name = basename(url)
+            local checksum_path = klua.paths.cache .. "/checksums/" .. name
+            local ok, dl_err = klua.download(url, checksum_path)
+            if ok then
+                local text = klua.read_file(checksum_path) or ""
+                local sidecar = checksum_asset.name == asset_name .. ".sha256"
+                    or checksum_asset.name == asset_name .. ".sha256sum"
+                local expected = parse_checksum_text(text, asset_name, sidecar)
+                if expected then
+                    checked = true
+                    if expected ~= actual then
+                        klua.error("SHA-256 mismatch for " .. asset_name .. ": expected "
+                            .. expected .. ", got " .. actual .. " (" .. label .. ")")
+                        return 1
+                    end
+                    klua.info("sha256 verified for " .. asset_name)
+                    return 0
+                end
+            else
+                klua.warn("could not download checksum asset " .. name .. ": "
+                    .. tostring(dl_err))
+            end
+        end
+    end
+
+    if not checked then
+        klua.warn("no matching SHA-256 entry found for " .. asset_name
+            .. "; install continues unverified")
+    end
+    return 0
 end
 
 -- ---------------------------------------------------------------------------
@@ -790,30 +1040,39 @@ local function github_install(rest)
     -- In-repo manifest takes priority over release heuristics.
     local manifest = fetch_manifest(klua.raw_github, user, name, tag)
 
-    local endpoint = tag and ("tags/" .. tag) or "latest"
-    local api = klua.github_api .. "/repos/" .. user .. "/" .. name .. "/releases/" .. endpoint
-    local body, status, err = klua.http_get(api)
-    if err then
-        klua.error("gh: request failed: " .. err)
-        return 1
-    end
-
-    local release = nil
-    if status == 200 then
-        local json_err
-        release, json_err = klua.json_parse(body)
-        if not release then
-            klua.error("gh: could not parse release JSON: " .. tostring(json_err))
+    -- Resolve the latest tag and asset list from GitHub's web endpoints first:
+    -- no api.github.com request, so unauthenticated installs never hit the
+    -- 60/hour REST limit. The API stays available as a fallback.
+    local release, web_err = github_web_release(user, name, tag)
+    if release then
+        klua.info("gh: resolved " .. repo .. " " .. release.tag_name .. " from web release")
+    else
+        klua.warn("gh: web release discovery failed (" .. tostring(web_err)
+            .. "); falling back to GitHub API")
+        local endpoint = tag and ("tags/" .. tag) or "latest"
+        local api = klua.github_api .. "/repos/" .. user .. "/" .. name .. "/releases/" .. endpoint
+        local body, status, err = klua.http_get(api)
+        if err then
+            klua.error("gh: request failed: " .. err)
             return 1
         end
-    elseif status ~= 404 then
-        klua.error("gh: GitHub API returned HTTP " .. tostring(status))
-        return 1
+        if status == 200 then
+            local json_err
+            release, json_err = klua.json_parse(body)
+            if not release then
+                klua.error("gh: could not parse release JSON: " .. tostring(json_err))
+                return 1
+            end
+        elseif status ~= 404 then
+            klua.error("gh: GitHub API returned HTTP " .. tostring(status))
+            return 1
+        end
     end
 
     if release then
         local version = release.tag_name or tag or "unknown"
-        local asset = select_asset(release.assets or {}, manifest, klua.platform())
+        local assets = release.assets or {}
+        local asset = select_asset(assets, manifest, klua.platform())
         if asset then
             klua.info("gh: " .. repo .. " " .. version .. " -> " .. asset.name)
             local payload = klua.paths.cache .. "/downloads/" .. asset.name
@@ -821,6 +1080,10 @@ local function github_install(rest)
             if not ok then
                 klua.error("gh: download failed: " .. tostring(dl_err))
                 return 1
+            end
+            local code = verify_checksum(payload, asset.name, assets, "gh:" .. repo)
+            if code ~= 0 then
+                return code
             end
             local store_dir = klua.paths.store .. "/gh/" .. user .. "/" .. name .. "/" .. version
             return install_payload(payload, asset.name, store_dir, name, manifest)
@@ -902,6 +1165,10 @@ local function gitlab_install(rest)
             if not ok then
                 klua.error("gl: download failed: " .. tostring(dl_err))
                 return 1
+            end
+            local code = verify_checksum(payload, asset_name, assets, "gl:" .. repo)
+            if code ~= 0 then
+                return code
             end
             local store_dir = klua.paths.store .. "/gl/" .. user .. "/" .. name .. "/" .. version
             return install_payload(payload, asset_name, store_dir, name, manifest)
@@ -1541,8 +1808,8 @@ function klua.commands.search(args)
         local base_reachable = false
         for _, shard in ipairs(SEARCH_SHARDS) do
             local url = strip_trailing_slash(base) .. "/v1/" .. shard .. ".yaml"
-            local body, status, err = klua.http_get(url)
-            if not err and status == 200 then
+            local body, err = fetch_shard(url)
+            if body then
                 base_reachable = true
                 local doc, parse_err = klua.yaml_parse(body)
                 if doc and type(doc) == "table" then

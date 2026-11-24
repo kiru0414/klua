@@ -56,6 +56,10 @@ fs::path cache_dir() {
     return xdg_dir("XDG_CACHE_HOME", fs::path{".cache"}) / "klua";
 }
 
+fs::path shards_dir() {
+    return cache_dir() / "shards";
+}
+
 fs::path user_init() {
     return config_dir() / "init.lua";
 }

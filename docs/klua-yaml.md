@@ -13,11 +13,12 @@ parses, it overrides the release heuristics. If it is missing, invalid, or
 comment-only, klua silently falls back to asset scoring.
 
 > **Safer than Homebrew, simpler than Nix, and infinitely hackable in Lua.**
-> A manifest only describes what lives in the isolated store; the v0.4.0 core
-> decides *how* it is exposed: library files stay in the store, PATH conflicts
-> are checked before every symlink, and Lua hooks can refine the policy.
+> A manifest only describes what lives in the isolated store; the core decides
+> *how* it is exposed: library files stay in the store, PATH conflicts are
+> checked before every symlink, downloads are checksum-verified, and Lua hooks
+> can refine the policy.
 
-## v0.4.0 manifest integration
+## v0.4.0+ manifest integration
 
 - `bins` are passed through the same conflict-safe linker as auto-detected
   executables. Library-looking names (`.so`, `.so.*`, `.dylib`, `.a`, `.la`,
@@ -31,6 +32,11 @@ comment-only, klua silently falls back to asset scoring.
 - Manage installed manifests with `klua search`, `klua info`, `klua cleanup`,
   `klua doctor` and `klua remove` (aliases `rm`, `uninstall`). Typos in these
   names or in flags get Levenshtein suggestions.
+- v0.5.0 resolves `gh:` releases without the REST API (HEAD redirect +
+  `expanded_assets`) and verifies the selected asset against a matching
+  `.sha256`, `.sha256sum` or `checksums.txt` before extraction. Use
+  `--skip-checksum` for an explicit bypass; use `--no-cache` to refetch alias
+  shards rather than the one-hour cached copy.
 - Custom Lua in `init.lua` can override the provider or command handlers that
   consume manifests. `klua repair` backs up your `init.lua` to
   `init.lua.bak.<timestamp>` before restoring the baseline; preview with
@@ -70,8 +76,10 @@ Explicit release-asset selection. Patterns support `*` (any run of
 characters) and `?` (one character); matching is case-sensitive and
 anchored (the whole asset name must match).
 
-- The first asset matching any pattern wins (assets are scanned in API
+- The first asset matching any pattern wins (assets are scanned in web/API
   order, patterns in list order).
+- Checksum sidecars are ignored for selection but are kept for verification
+  after download.
 - When `assets` is present it **replaces** OS/arch scoring entirely —
   include the OS/arch tokens in your patterns yourself.
 - If nothing matches, klua falls through to `build.steps` (if present),

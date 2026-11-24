@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(klua
-    VERSION 0.4.0
+    VERSION 0.5.0
     DESCRIPTION "A fast, self-healing package manager powered by C++20 and Lua 5.4"
     LANGUAGES C CXX)
 
@@ -27,6 +27,9 @@ if(POLICY CMP0169)
 endif()
 
 include(FetchContent)
+
+# OpenSSL supplies both HTTPS (cpp-httplib) and the EVP SHA-256 primitive.
+find_package(OpenSSL REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Dependencies (fetched at configure time, no system packages required)
@@ -140,6 +143,7 @@ add_executable(klua
     src/lua_engine.cpp
     src/sys.cpp
     src/http.cpp
+    src/crypto.cpp
     src/archive.cpp
     src/fsops.cpp
     src/serialize.cpp)
@@ -157,7 +161,8 @@ target_link_libraries(klua PRIVATE
     klua_lua54
     yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json
-    httplib::httplib)
+    httplib::httplib
+    OpenSSL::Crypto)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(klua PRIVATE -Wall -Wextra -Wpedantic)

@@ -293,7 +293,8 @@ void suggest_cli_typos(int argc, char** argv) {
         "init-manifest", "remove", "rm", "uninstall", "run", "search", "info",
         "cleanup", "doctor"};
     const std::vector<std::string> flags = {"--help", "-h", "--version", "--force",
-                                            "--as", "--dry-run", "--diff"};
+                                            "--as", "--no-cache", "--skip-checksum",
+                                            "--dry-run", "--diff"};
 
     for (int index = 1; index < argc; ++index) {
         const std::string token = argv[index];
@@ -345,6 +346,15 @@ int main(int argc, char** argv) {
 
     CommandArgs args;
 
+    bool no_cache = false;
+    bool skip_checksum = false;
+    auto add_fetch_flags = [&](CLI::App* command) {
+        command->add_flag("--no-cache", no_cache,
+                          "Bypass registry shard cache and refetch");
+        command->add_flag("--skip-checksum", skip_checksum,
+                          "Install even when SHA-256 verification fails");
+    };
+
     bool install_force = false;
     std::string install_as;
     auto* install = app.add_subcommand("install", "Install packages (scheme targets such as gh:user/repo)")
@@ -354,6 +364,7 @@ int main(int argc, char** argv) {
                       "Link even when a command would shadow a system/protected binary");
     install->add_option("--as", install_as,
                         "Link the primary binary under this name instead of its own");
+    add_fetch_flags(install);
 
     auto* add = app.add_subcommand("add", "Record targets in packages.yaml without installing");
     add->add_option("targets", args.add_targets, "Targets to record")->required();
@@ -362,27 +373,34 @@ int main(int argc, char** argv) {
                         ->alias("rm")
                         ->alias("uninstall");
     remove->add_option("targets", args.remove_targets, "Packages to remove")->required();
+    add_fetch_flags(remove);
 
     // `run` is a prefix command: everything after the package target is passed
     // through unchanged to the executed binary (flags included).
     auto* run = app.add_subcommand("run", "Run a package binary from the store without linking it");
     run->prefix_command();
+    add_fetch_flags(run);
 
     auto* search = app.add_subcommand("search", "Search aliases across configured registries");
     search->add_option("query", args.search_query, "Substring to match in aliases or targets")->required();
+    add_fetch_flags(search);
 
     auto* info = app.add_subcommand("info", "Show package details (installed state, store path, release)");
     info->add_option("target", args.info_target, "Alias or scheme target")->required();
+    add_fetch_flags(info);
 
     auto* cleanup = app.add_subcommand("cleanup", "Remove old store versions, broken links and caches");
 
     auto* doctor = app.add_subcommand("doctor", "Diagnose the klua installation and PATH setup");
+    add_fetch_flags(doctor);
 
     auto* sync = app.add_subcommand("sync", "Install everything declared in a local or remote YAML source");
     sync->add_option("source", args.sync_source, "Local path or URL of the YAML source");
+    add_fetch_flags(sync);
 
     auto* upgrade = app.add_subcommand("upgrade", "Upgrade installed packages");
     upgrade->add_option("targets", args.upgrade_targets, "Packages to upgrade (default: all)");
+    add_fetch_flags(upgrade);
 
     bool repair_dry_run = false;
     auto* repair = app.add_subcommand("repair", "Restore ~/.config/klua/init.lua from the built-in defaults (backs up the old file)");
@@ -442,6 +460,10 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+
+    // Publish CLI-wide switches after the self-healing startup sequence so a
+    // reset engine still sees them.
+    engine.set_cli_flags(no_cache, skip_checksum);
 
     // Dispatch the parsed subcommand into the Lua layer.
     if (run->parsed()) {

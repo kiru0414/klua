@@ -21,6 +21,9 @@ std::filesystem::path bin_dir();
 // $XDG_CACHE_HOME/klua or ~/.cache/klua
 std::filesystem::path cache_dir();
 
+// $XDG_CACHE_HOME/klua/shards (cached registry shards)
+std::filesystem::path shards_dir();
+
 // Individual files inside config_dir().
 std::filesystem::path user_init();      // init.lua
 std::filesystem::path packages_file();  // packages.yaml

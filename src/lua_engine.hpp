@@ -34,6 +34,10 @@ public:
     // exit code (0 on success, 1 on Lua errors or missing handlers).
     int run_command(const std::string& name, const std::vector<std::string>& args);
 
+    // Publish CLI-wide switches to the Lua layer after bootstrap, so command
+    // handlers can honour --no-cache and --skip-checksum.
+    void set_cli_flags(bool no_cache, bool skip_checksum);
+
 private:
     void bind_natives();
 
