@@ -59,6 +59,44 @@ local function dedupe(list)
     return result
 end
 
+-- Classic Levenshtein distance (two-row, O(n*m) time, O(m) space).
+local function levenshtein(a, b)
+    local la, lb = #a, #b
+    local prev = {}
+    for j = 0, lb do
+        prev[j] = j
+    end
+    for i = 1, la do
+        local cur = { [0] = i }
+        local ai = string.byte(a, i)
+        for j = 1, lb do
+            local cost = (ai == string.byte(b, j)) and 0 or 1
+            local deletion = prev[j] + 1
+            local insertion = cur[j - 1] + 1
+            local substitution = prev[j - 1] + cost
+            cur[j] = math.min(deletion, insertion, substitution)
+        end
+        prev = cur
+    end
+    return prev[lb]
+end
+
+-- Pick the closest candidate within a length-relative threshold.
+local function closest_match(target, candidates, threshold_divisor)
+    local best, best_distance = nil, math.huge
+    for _, candidate in ipairs(candidates) do
+        local distance = levenshtein(target, candidate)
+        if distance < best_distance then
+            best, best_distance = candidate, distance
+        end
+    end
+    local threshold = math.max(1, math.floor(#target / (threshold_divisor or 3)))
+    if best and best_distance <= threshold then
+        return best
+    end
+    return nil
+end
+
 -- POSIX shell quoting for commands passed to klua.exec.
 local function shq(value)
     return "'" .. string.gsub(value, "'", "'\\''") .. "'"
@@ -153,12 +191,19 @@ local function resolve_alias(target)
     end
 
     local shard = shard_char(target)
+    local candidates, seen = {}, {}
     for _, base in ipairs(registries) do
         local url = strip_trailing_slash(base) .. "/v1/" .. shard .. ".yaml"
         local body, status, err = klua.http_get(url)
         if not err and status == 200 then
             local doc, parse_err = klua.yaml_parse(body)
             if doc and type(doc) == "table" then
+                for key in pairs(doc) do
+                    if type(key) == "string" and not seen[key] then
+                        seen[key] = true
+                        candidates[#candidates + 1] = key
+                    end
+                end
                 local resolved = doc[target]
                 if type(resolved) == "string" and resolved ~= "" then
                     return resolved
@@ -168,7 +213,7 @@ local function resolve_alias(target)
             end
         end
     end
-    return nil, "alias '" .. target .. "' not found in any configured registry"
+    return nil, "alias '" .. target .. "' not found in any configured registry", candidates
 end
 
 -- ---------------------------------------------------------------------------
@@ -758,8 +803,12 @@ end)
 local function install_one(target)
     local scheme, rest = string.match(target, "^([%w][%w+_-]*):(.+)$")
     if not scheme then
-        local resolved, err = resolve_alias(target)
+        local resolved, err, candidates = resolve_alias(target)
         if not resolved then
+            local suggestion = closest_match(target, candidates or {})
+            if suggestion then
+                klua.warn("did you mean '" .. suggestion .. "'?")
+            end
             klua.error(err)
             return 1
         end
@@ -909,6 +958,118 @@ function klua.commands.add(args)
     end
     klua.info("packages.yaml updated (" .. #packages .. " target(s))")
     return 0
+end
+
+-- Resolve a scheme target to its store directory (provider + package path,
+-- no version). Mirrors the layouts used by the install providers.
+local function store_path_for(scheme, rest)
+    if scheme == "gh" or scheme == "gl" then
+        local repo = string.match(rest, "^([^@]+)") or rest
+        local user, name = string.match(repo, "^([^/]+)/([^/]+)$")
+        if not user then
+            return nil
+        end
+        return klua.paths.store .. "/" .. scheme .. "/" .. user .. "/" .. name
+    elseif scheme == "url" then
+        local path_part = string.match(rest, "^https?://[^/]+(/[^?#]*)") or "/"
+        local asset_name = basename(path_part)
+        if asset_name == "" or asset_name == "/" then
+            return nil
+        end
+        local host = string.match(rest, "^https?://([^/]+)") or "unknown-host"
+        local stem = string.gsub(asset_name, "%.[^.]+$", "")
+        stem = string.gsub(stem, "%.tar$", "")
+        return klua.paths.store .. "/url/" .. host .. "/" .. stem .. "/direct"
+    end
+    return nil
+end
+
+-- Drop removed targets (and their resolved/untagged forms) from packages.yaml.
+local function prune_packages(removed)
+    local includes, packages = load_packages_file()
+    local kept = {}
+    for _, existing in ipairs(packages) do
+        if not removed[existing] then
+            kept[#kept + 1] = existing
+        end
+    end
+    if #kept ~= #packages then
+        return save_packages_file(includes, kept)
+    end
+    return true
+end
+
+function klua.commands.remove(args)
+    if #args == 0 then
+        klua.error("usage: klua remove <target> [<target>...]")
+        return 1
+    end
+
+    local removed = {}
+    local status = 0
+    for _, arg in ipairs(args) do
+        local scheme, rest = string.match(arg, "^([%w][%w+_-]*):(.+)$")
+        local resolved = arg
+        if not scheme then
+            local alias_target, err, candidates = resolve_alias(arg)
+            if not alias_target then
+                local match = closest_match(arg, candidates or {})
+                if match then
+                    klua.warn("did you mean '" .. match .. "'?")
+                end
+                klua.error(err)
+                status = 1
+            else
+                resolved = alias_target
+                scheme, rest = string.match(resolved, "^([%w][%w+_-]*):(.+)$")
+            end
+        end
+
+        if scheme then
+            local store_dir = store_path_for(scheme, rest)
+            if not store_dir or not klua.file_exists(store_dir) then
+                klua.error("package not installed: " .. arg)
+                status = 1
+            else
+                local links = {}
+                for _, entry in ipairs(klua.list_dir(klua.paths.bin)) do
+                    if not entry.is_dir then
+                        local target = klua.readlink(entry.path)
+                        if target and (target == store_dir
+                            or string.sub(target, 1, #store_dir + 1) == store_dir .. "/") then
+                            local ok, err = klua.remove(entry.path)
+                            if not ok then
+                                klua.error(tostring(err))
+                                status = 1
+                            else
+                                links[#links + 1] = entry.name
+                            end
+                        end
+                    end
+                end
+
+                local ok, err = klua.remove(store_dir)
+                if not ok then
+                    klua.error(tostring(err))
+                    status = 1
+                else
+                    local suffix = #links > 0 and (" (" .. table.concat(links, ", ") .. ")") or ""
+                    klua.info("removed " .. scheme .. ":" .. rest .. suffix)
+                    removed[arg] = true
+                    removed[resolved] = true
+                    local untagged = string.match(rest, "^([^@]+)")
+                    if untagged then
+                        removed[scheme .. ":" .. untagged] = true
+                    end
+                end
+            end
+        end
+    end
+
+    if next(removed) and not prune_packages(removed) then
+        return 1
+    end
+    return status
 end
 
 -- Read a sync source (local path or URL); returns content, error, resolved

@@ -30,6 +30,9 @@ jobs:
       - name: Milestone 3 tests (manifests, sync, upgrade)
         run: bash tests/test_milestone3.sh
 
+      - name: UX tests (remove, typo suggestions)
+        run: bash tests/test_ux.sh
+
   build-macos:
     name: Build (macOS arm64)
     runs-on: macos-14

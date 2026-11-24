@@ -10,6 +10,8 @@
 
 #include <CLI/CLI.hpp>
 
+#include <algorithm>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -48,10 +50,80 @@ int run_repair() {
     return 0;
 }
 
+// --- CLI typo suggestions -------------------------------------------------
+// CLI11 rejects unknown subcommands/flags with a generic message; add a
+// "did you mean" hint based on Levenshtein distance.
+
+std::size_t levenshtein_distance(const std::string& a, const std::string& b) {
+    std::vector<std::size_t> prev(b.size() + 1);
+    for (std::size_t j = 0; j <= b.size(); ++j) {
+        prev[j] = j;
+    }
+    for (std::size_t i = 1; i <= a.size(); ++i) {
+        std::vector<std::size_t> cur(b.size() + 1);
+        cur[0] = i;
+        for (std::size_t j = 1; j <= b.size(); ++j) {
+            const std::size_t cost = a[i - 1] == b[j - 1] ? 0 : 1;
+            cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost});
+        }
+        prev = std::move(cur);
+    }
+    return prev[b.size()];
+}
+
+std::string closest_word(const std::string& input, const std::vector<std::string>& words) {
+    std::string best;
+    std::size_t best_distance = std::string::npos;
+    for (const auto& word : words) {
+        const std::size_t distance = levenshtein_distance(input, word);
+        if (distance < best_distance) {
+            best = word;
+            best_distance = distance;
+        }
+    }
+    const std::size_t threshold = std::max<std::size_t>(1, input.size() / 3);
+    return (!best.empty() && best_distance <= threshold) ? best : std::string{};
+}
+
+void suggest_cli_typos(int argc, char** argv) {
+    const std::vector<std::string> commands = {
+        "install", "i", "add", "sync", "upgrade", "repair", "tap", "list",
+        "init-manifest", "remove", "rm", "uninstall"};
+    const std::vector<std::string> flags = {"--help", "-h", "--version", "--force"};
+
+    for (int index = 1; index < argc; ++index) {
+        const std::string token = argv[index];
+        if (token.empty()) {
+            continue;
+        }
+        if (token[0] == '-') {
+            if (std::find(flags.begin(), flags.end(), token) != flags.end()) {
+                continue; // valid flag, nothing to suggest
+            }
+            const std::string match = closest_word(token, flags);
+            if (!match.empty()) {
+                std::cerr << "warning: unknown option '" << token
+                          << "'; did you mean '" << match << "'?\n";
+            }
+        } else {
+            if (std::find(commands.begin(), commands.end(), token) != commands.end()) {
+                continue; // valid subcommand
+            }
+            const std::string match = closest_word(token, commands);
+            if (!match.empty()) {
+                std::cerr << "warning: unknown command '" << token
+                          << "'; did you mean '" << match << "'?\n";
+                break;
+            }
+        }
+    }
+}
+
 // Positional arguments collected per subcommand.
 struct CommandArgs {
     std::vector<std::string> install_targets;
     std::vector<std::string> add_targets;
+    std::vector<std::string> remove_targets;
     std::string sync_source;
     std::vector<std::string> upgrade_targets;
     std::string tap_action;
@@ -74,6 +146,11 @@ int main(int argc, char** argv) {
     auto* add = app.add_subcommand("add", "Record targets in packages.yaml without installing");
     add->add_option("targets", args.add_targets, "Targets to record")->required();
 
+    auto* remove = app.add_subcommand("remove", "Remove installed packages, store dirs and ~/.local/bin symlinks")
+                        ->alias("rm")
+                        ->alias("uninstall");
+    remove->add_option("targets", args.remove_targets, "Packages to remove")->required();
+
     auto* sync = app.add_subcommand("sync", "Install everything declared in a local or remote YAML source");
     sync->add_option("source", args.sync_source, "Local path or URL of the YAML source");
 
@@ -95,6 +172,12 @@ int main(int argc, char** argv) {
     try {
         app.parse(argc, argv);
     } catch (const CLI::ParseError& e) {
+        // Add a typo hint for unknown subcommands/flags, but never for the
+        // help/version pseudo-errors (which print and exit 0).
+        if (dynamic_cast<const CLI::CallForHelp*>(&e) == nullptr
+            && dynamic_cast<const CLI::CallForVersion*>(&e) == nullptr) {
+            suggest_cli_typos(argc, argv);
+        }
         // app.exit() prints the diagnostic (or help/version text) and returns
         // CLI11's own exit code; normalize usage errors to a plain 1.
         const int code = app.exit(e);
@@ -136,6 +219,9 @@ int main(int argc, char** argv) {
     }
     if (add->parsed()) {
         return engine.run_command("add", args.add_targets);
+    }
+    if (remove->parsed()) {
+        return engine.run_command("remove", args.remove_targets);
     }
     if (sync->parsed()) {
         std::vector<std::string> sync_args;

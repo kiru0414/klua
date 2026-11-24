@@ -64,6 +64,8 @@ Manifests (`klua.yaml`), `sync` and `upgrade` arrive in Milestone 3. See
   cycle protection, and deduplicates entries.
 - `klua upgrade [target...]` reinstalls latest releases and reports version
   changes; without arguments it upgrades every installed gh/gl package.
+- `klua remove <target...>` (`rm`, `uninstall`) deletes `~/.local/bin`
+  symlinks, the store directory, and matching `packages.yaml` entries.
 - `klua init-manifest [--force]` generates a starter `klua.yaml`.
 - Official registry default:
   `https://raw.githubusercontent.com/kiru0414/klua-registry/main`
@@ -113,6 +115,7 @@ klua add gh:jqlang/jq fd      # record targets in packages.yaml
 klua sync                     # install everything in packages.yaml
 klua sync https://host/dotfiles.yaml  # remote source, follows includes:
 klua upgrade                  # upgrade all installed packages
+klua remove fd                # delete symlinks, store dir, packages.yaml entry
 klua list                     # installed packages from the store
 klua init-manifest            # starter klua.yaml for a package repo
 klua repair                   # restore a clean ~/.config/klua/init.lua
@@ -143,7 +146,7 @@ end)
 
 Native primitives available to Lua: `klua.info/warn/error`,
 `klua.file_exists/read_file/write_file/mkdir/copy/remove/list_dir`,
-`klua.find_executables`, `klua.env`, `klua.exec`, `klua.register_provider`,
-`klua.http_get/download`, `klua.extract/is_archive`, `klua.symlink`,
-`klua.chmod_exec`, `klua.json_parse/yaml_parse`, `klua.platform`,
-`klua.paths`, `klua.version`.
+`klua.find_executables`, `klua.readlink`, `klua.env`, `klua.exec`,
+`klua.register_provider`, `klua.http_get/download`, `klua.extract/is_archive`,
+`klua.symlink`, `klua.chmod_exec`, `klua.json_parse/yaml_parse`,
+`klua.platform`, `klua.paths`, `klua.version`.

@@ -55,6 +55,7 @@ klua.error("message")   -- stderr, "error: " prefix
 | `klua.list_dir(path)` | array | entries `{name=, path=, is_dir=}`, sorted; empty when missing |
 | `klua.find_executables(dir)` | array | recursive; ELF/Mach-O magic or any exec bit; skips `.sha256 .sha256sum .sig .asc .md .txt .json .yaml .yml .pem .pub .html`; sorted |
 | `klua.symlink(target, link)` | ok, err | POSIX symlink; replaces existing entries incl. dangling links; creates parent dirs |
+| `klua.readlink(path)` | string or nil | raw symlink target (no resolution); nil when not a symlink |
 | `klua.chmod_exec(path)` | ok, err | adds `u+x,g+x,o+x` |
 | `klua.cwd()` | string | process working directory |
 | `klua.env(name)` | string or nil | environment variable |
@@ -139,9 +140,10 @@ caught and reported; the install fails with exit 1.
 ## Command handlers
 
 The CLI dispatches `klua.commands.<name>(args)` where `args` is an array
-of positional strings. Names: `install`, `add`, `sync`, `upgrade`, `tap`,
-`list`, `init-manifest` (note the dash: `klua.commands["init-manifest"]`).
-Return a process exit code. Override or wrap freely:
+of positional strings. Names: `install`, `add`, `remove`, `sync`,
+`upgrade`, `tap`, `list`, `init-manifest` (note the dash:
+`klua.commands["init-manifest"]`). Return a process exit code. Override or
+wrap freely:
 
 ```lua
 local default_list = klua.commands.list

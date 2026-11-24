@@ -70,6 +70,7 @@ relative layouts of complex tools survive.
 ```
 klua install <target>...   (alias: klua i)
 klua add <target>...
+klua remove <target>...    (aliases: klua rm, klua uninstall)
 klua sync [path_or_url]
 klua upgrade [target...]
 klua tap <add|remove|list> [url]
@@ -77,6 +78,17 @@ klua list
 klua repair
 klua init-manifest [--force]
 klua --version | --help
+```
+
+Mistyped subcommands, flags, and aliases get a Levenshtein-based hint:
+
+```
+$ klua instll
+warning: unknown command 'instll'; did you mean 'install'?
+$ klua --helo
+warning: unknown option '--helo'; did you mean '--help'?
+$ klua i bzp3
+warning: did you mean 'bzip3'?
 ```
 
 ### install / i
@@ -129,6 +141,21 @@ klua tap list
 klua tap remove https://example.com/my-registry
 klua list                        # provider:user/repo  version, from the store
 ```
+
+### remove / rm / uninstall
+
+```sh
+klua remove fd                   # alias target
+klua rm gh:jqlang/jq             # scheme target
+klua uninstall url:https://example.com/tool.tar.gz
+```
+
+Removal is complete: symlinks in `~/.local/bin` that point into the
+package's store directory are deleted, the store tree
+(`~/.local/share/klua/store/<provider>/<user>/<repo>/`) is removed, and
+matching entries in `packages.yaml` (bare alias, resolved target, or
+untagged scheme target) are pruned. Removing a package that is not
+installed reports an error and changes nothing.
 
 ### repair
 
