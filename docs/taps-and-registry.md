@@ -52,7 +52,9 @@ https://raw.githubusercontent.com/kiru0414/klua-registry/main
 ```
 
 Starter content lives in [`registry-template/`](../registry-template/README.md)
-of this repository.
+of this repository. Copy its `v1/` contents to the **root** of the registry
+repository — nesting them under `registry-template/v1/` makes every shard
+404.
 
 ### Contributing an alias
 

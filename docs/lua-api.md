@@ -86,6 +86,9 @@ local ok, err = klua.download("https://host/tool.tar.gz", "/path/dest")
   the private-auth recipe below for authenticated requests.
 - `download` streams to disk, creates parent dirs, accepts only HTTP 200,
   and removes partial files on failure.
+- Transient failures (`403`, `429`, `5xx`, dropped connections — common with
+  GitHub's release-asset CDN) are retried up to 4 times with exponential
+  backoff.
 - Timeouts: 30 s connect, 300 s read, 120 s write.
 
 ## Archives

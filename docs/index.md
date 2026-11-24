@@ -67,7 +67,8 @@ Manifests (`klua.yaml`), `sync` and `upgrade` arrive in Milestone 3. See
 - Official registry default:
   `https://raw.githubusercontent.com/kiru0414/klua-registry/main`
   (githubusercontent.com). Starter shard content lives in
-  `registry-template/v1/` — push it to the `klua-registry` repository.
+  `registry-template/v1/` — copy its contents (`v1/`) to the **root** of
+  the `klua-registry` repository (not the `registry-template/` wrapper).
 - `.github/workflows/release.yml` builds static Linux binaries (x86_64 +
   arm64) and macOS binaries (x86_64 + arm64) on `v*` tags and attaches
   them to the GitHub release.

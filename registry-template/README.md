@@ -1,14 +1,30 @@
 # klua official registry template
 
 This folder is the starter content for the official alias registry
-(`kiru0414/klua-registry`). Push it to a public GitHub repository named
-`klua-registry`; klua fetches shards from:
+(`kiru0414/klua-registry`).
+
+> **Deployment path matters:** copy the *contents* of this folder — the
+> `v1/` directory (and optionally `README.md`) — to the **root** of the
+> `klua-registry` repository. Do **not** commit the `registry-template/`
+> wrapper directory itself, or shards end up at `registry-template/v1/`
+> and klua's `<registry>/v1/<char>.yaml` requests will 404.
+
+klua fetches shards from:
 
 ```
 https://raw.githubusercontent.com/kiru0414/klua-registry/main/v1/<char>.yaml
 ```
 
 That URL is the default registry embedded in `builtin/default_init.lua`.
+The resulting repository layout must be:
+
+```
+README.md
+v1/
+  b.yaml
+  f.yaml
+  ...
+```
 
 ## Shard format
 
