@@ -294,7 +294,7 @@ void suggest_cli_typos(int argc, char** argv) {
         "cleanup", "doctor"};
     const std::vector<std::string> flags = {"--help", "-h", "--version", "--force",
                                             "--as", "--no-cache", "--skip-checksum",
-                                            "--dry-run", "--diff"};
+                                            "--locked", "--lock", "--dry-run", "--diff"};
 
     for (int index = 1; index < argc; ++index) {
         const std::string token = argv[index];
@@ -348,11 +348,19 @@ int main(int argc, char** argv) {
 
     bool no_cache = false;
     bool skip_checksum = false;
+    bool locked = false;
+    bool lock = false;
     auto add_fetch_flags = [&](CLI::App* command) {
         command->add_flag("--no-cache", no_cache,
                           "Bypass registry shard cache and refetch");
         command->add_flag("--skip-checksum", skip_checksum,
                           "Install even when SHA-256 verification fails");
+    };
+    auto add_lock_flags = [&](CLI::App* command) {
+        command->add_flag("--locked", locked,
+                          "Require and reproduce packages.lock.yaml exactly");
+        command->add_flag("--lock", lock,
+                          "Write resolved versions, URLs and SHA-256 hashes to the lockfile");
     };
 
     bool install_force = false;
@@ -365,6 +373,7 @@ int main(int argc, char** argv) {
     install->add_option("--as", install_as,
                         "Link the primary binary under this name instead of its own");
     add_fetch_flags(install);
+    add_lock_flags(install);
 
     auto* add = app.add_subcommand("add", "Record targets in packages.yaml without installing");
     add->add_option("targets", args.add_targets, "Targets to record")->required();
@@ -397,10 +406,12 @@ int main(int argc, char** argv) {
     auto* sync = app.add_subcommand("sync", "Install everything declared in a local or remote YAML source");
     sync->add_option("source", args.sync_source, "Local path or URL of the YAML source");
     add_fetch_flags(sync);
+    add_lock_flags(sync);
 
     auto* upgrade = app.add_subcommand("upgrade", "Upgrade installed packages");
     upgrade->add_option("targets", args.upgrade_targets, "Packages to upgrade (default: all)");
     add_fetch_flags(upgrade);
+    add_lock_flags(upgrade);
 
     bool repair_dry_run = false;
     auto* repair = app.add_subcommand("repair", "Restore ~/.config/klua/init.lua from the built-in defaults (backs up the old file)");
@@ -430,6 +441,15 @@ int main(int argc, char** argv) {
         // CLI11's own exit code; normalize usage errors to a plain 1.
         const int code = app.exit(e);
         return code == 0 ? 0 : 1;
+    }
+
+    if (locked && lock) {
+        std::cerr << "error: --locked and --lock are mutually exclusive\n";
+        return 1;
+    }
+    if (locked && skip_checksum) {
+        std::cerr << "error: --skip-checksum cannot be combined with --locked\n";
+        return 1;
     }
 
     // Repair never touches Lua: it must succeed even with a broken engine.
@@ -463,7 +483,7 @@ int main(int argc, char** argv) {
 
     // Publish CLI-wide switches after the self-healing startup sequence so a
     // reset engine still sees them.
-    engine.set_cli_flags(no_cache, skip_checksum);
+    engine.set_cli_flags(no_cache, skip_checksum, locked, lock);
 
     // Dispatch the parsed subcommand into the Lua layer.
     if (run->parsed()) {

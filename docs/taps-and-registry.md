@@ -58,8 +58,10 @@ fzf: gh:junegunn/fzf
 ```
 
 Valid target schemes: `gh:user/repo[@tag]`, `gl:user/repo[@tag]`,
-`url:https://...`, `apt:pkg`. Aliases starting with a digit or symbol go
-in `v1/_.yaml`.
+`url:https://...`, `sys:pkg1,pkg2` (also `apt:pkg`, `brew:pkg`, ...). Aliases
+starting with a digit or symbol go in `v1/_.yaml`. The starter shards include
+`ripgrep`, `fd`, `bat`, `eza`, `fzf`, `zoxide`, `starship`, `neovim`/`nvim`,
+`gh`, `lazygit` and `glab`.
 
 ## The official registry
 

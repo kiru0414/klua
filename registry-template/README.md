@@ -37,8 +37,11 @@ fd: gh:sharkdp/fd
 fzf: gh:junegunn/fzf
 ```
 
+The starter shards include aliases for `ripgrep`, `fd`, `bat`, `eza`, `fzf`,
+`zoxide`, `starship`, `neovim`/`nvim`, `gh`, `lazygit` and `glab`.
+
 Supported target schemes: `gh:user/repo[@tag]`, `gl:user/repo[@tag]`,
-`url:https://...`, `apt:pkg`.
+`url:https://...`, `sys:pkg1,pkg2` (also `apt:pkg`, `brew:pkg`, ...).
 
 ## Adding an alias
 

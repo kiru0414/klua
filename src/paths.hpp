@@ -25,9 +25,10 @@ std::filesystem::path cache_dir();
 std::filesystem::path shards_dir();
 
 // Individual files inside config_dir().
-std::filesystem::path user_init();      // init.lua
-std::filesystem::path packages_file();  // packages.yaml
-std::filesystem::path taps_file();      // taps.yaml
+std::filesystem::path user_init();       // init.lua
+std::filesystem::path packages_file();   // packages.yaml
+std::filesystem::path lock_file();       // packages.lock.yaml
+std::filesystem::path taps_file();       // taps.yaml
 
 // Create a directory (and parents) if missing. Returns false on failure.
 bool ensure_dir(const std::filesystem::path& dir);

@@ -13,6 +13,7 @@
 --   klua.copy / klua.remove / klua.list_dir / klua.find_executables
 --   klua.readlink / klua.env / klua.exec / klua.register_provider
 --   klua.http_get / klua.http_head_redirect / klua.download
+--   klua.system (optional manager overrides), klua.lockfile
 --   klua.sha256 / klua.extract / klua.is_archive
 --   klua.symlink / klua.chmod_exec / klua.json_parse / klua.yaml_parse
 
@@ -46,6 +47,25 @@ klua.github_web = klua.github_web or "https://github.com"
 -- init.lua to change it, or pass --no-cache to force a fresh fetch.
 klua.shard_ttl = klua.shard_ttl or 3600
 klua.cli_flags = klua.cli_flags or {}
+
+-- System package delegation can be configured in init.lua with:
+--   klua.system.manager     -- "apt", "dnf", "yum", "pacman", "apk" or "brew"
+--   klua.system.status(pkg) -- true/0 when installed (custom predicate)
+--   klua.system.install(pkgs) -- install the whole missing batch (custom hook)
+-- Otherwise the manager is detected at runtime and sudo is used when needed.
+klua.system = klua.system or {}
+
+-- Reproducible lock state, populated lazily from packages.lock.yaml.
+klua.lockfile = klua.lockfile or {}
+
+-- Forward declarations: dependency hooks and the system batch flusher are
+-- defined below but called from the release providers.
+local install_one
+local install_dependencies
+local flush_system_packages
+local lock_entry_for
+local record_lock_entry
+local verify_locked_digest
 
 -- ---------------------------------------------------------------------------
 -- Small helpers
@@ -1026,7 +1046,7 @@ end
 -- GitHub provider: gh:user/repo[@tag]
 -- ---------------------------------------------------------------------------
 
-local function github_install(rest)
+local function github_install(rest, target_key)
     local repo, tag = string.match(rest, "^([^@]+)@(.+)$")
     if not repo then
         repo = rest
@@ -1037,42 +1057,79 @@ local function github_install(rest)
         return 1
     end
 
-    -- In-repo manifest takes priority over release heuristics.
-    local manifest = fetch_manifest(klua.raw_github, user, name, tag)
+    local key = target_key or ("gh:" .. repo)
+    local flags = klua.cli_flags or {}
+    local lock_entry, lock_failed = lock_entry_for(key, "gh")
+    if lock_failed then
+        return 1
+    end
+    if lock_entry and tag and lock_entry.version ~= tag then
+        klua.error("--locked: requested tag '" .. tag .. "' for " .. key
+            .. " but lockfile records '" .. tostring(lock_entry.version) .. "'")
+        return 1
+    end
+    local resolved_tag = tag or (lock_entry and lock_entry.version) or nil
 
-    -- Resolve the latest tag and asset list from GitHub's web endpoints first:
-    -- no api.github.com request, so unauthenticated installs never hit the
-    -- 60/hour REST limit. The API stays available as a fallback.
-    local release, web_err = github_web_release(user, name, tag)
-    if release then
-        klua.info("gh: resolved " .. repo .. " " .. release.tag_name .. " from web release")
+    local release = nil
+    if lock_entry then
+        klua.info("gh: using lockfile entry for " .. repo .. " " .. lock_entry.version)
+        release = {
+            tag_name = lock_entry.version,
+            assets = {{ name = lock_entry.asset, browser_download_url = lock_entry.url }},
+        }
     else
-        klua.warn("gh: web release discovery failed (" .. tostring(web_err)
-            .. "); falling back to GitHub API")
-        local endpoint = tag and ("tags/" .. tag) or "latest"
-        local api = klua.github_api .. "/repos/" .. user .. "/" .. name .. "/releases/" .. endpoint
-        local body, status, err = klua.http_get(api)
-        if err then
-            klua.error("gh: request failed: " .. err)
-            return 1
-        end
-        if status == 200 then
-            local json_err
-            release, json_err = klua.json_parse(body)
-            if not release then
-                klua.error("gh: could not parse release JSON: " .. tostring(json_err))
+        -- Resolve the latest tag from GitHub's web endpoints first: no
+        -- api.github.com request, so installs never hit the REST rate limit.
+        -- The API remains a fallback for layout changes or private repos.
+        local web_err
+        release, web_err = github_web_release(user, name, resolved_tag)
+        if release then
+            klua.info("gh: resolved " .. repo .. " " .. release.tag_name .. " from web release")
+        else
+            klua.warn("gh: web release discovery failed (" .. tostring(web_err)
+                .. "); falling back to GitHub API")
+            local endpoint = resolved_tag and ("tags/" .. resolved_tag) or "latest"
+            local api = klua.github_api .. "/repos/" .. user .. "/" .. name .. "/releases/" .. endpoint
+            local body, status, err = klua.http_get(api)
+            if err then
+                klua.error("gh: request failed: " .. err)
                 return 1
             end
-        elseif status ~= 404 then
-            klua.error("gh: GitHub API returned HTTP " .. tostring(status))
-            return 1
+            if status == 200 then
+                local json_err
+                release, json_err = klua.json_parse(body)
+                if not release then
+                    klua.error("gh: could not parse release JSON: " .. tostring(json_err))
+                    return 1
+                end
+            elseif status ~= 404 then
+                klua.error("gh: GitHub API returned HTTP " .. tostring(status))
+                return 1
+            end
+        end
+    end
+
+    -- Fetch the in-repo manifest using the resolved tag so `depends:` is
+    -- read from the exact version being installed. HEAD is still tried first
+    -- for source-only repositories that have no release.
+    local manifest = fetch_manifest(klua.raw_github, user, name, resolved_tag)
+    if release and release.tag_name and release.tag_name ~= resolved_tag then
+        local tagged = fetch_manifest(klua.raw_github, user, name, release.tag_name)
+        if tagged then
+            manifest = tagged
+        end
+    end
+    if manifest then
+        local code = install_dependencies(manifest)
+        if code ~= 0 then
+            return code
         end
     end
 
     if release then
-        local version = release.tag_name or tag or "unknown"
+        local version = release.tag_name or resolved_tag or "unknown"
         local assets = release.assets or {}
-        local asset = select_asset(assets, manifest, klua.platform())
+        local asset = lock_entry and assets[1] or select_asset(assets, manifest, klua.platform())
         if asset then
             klua.info("gh: " .. repo .. " " .. version .. " -> " .. asset.name)
             local payload = klua.paths.cache .. "/downloads/" .. asset.name
@@ -1081,21 +1138,45 @@ local function github_install(rest)
                 klua.error("gh: download failed: " .. tostring(dl_err))
                 return 1
             end
-            local code = verify_checksum(payload, asset.name, assets, "gh:" .. repo)
-            if code ~= 0 then
-                return code
+
+            if lock_entry then
+                local code = verify_locked_digest(payload, asset.name, lock_entry, "gh:" .. repo)
+                if code ~= 0 then
+                    return code
+                end
+            else
+                local code = verify_checksum(payload, asset.name, assets, "gh:" .. repo)
+                if code ~= 0 then
+                    return code
+                end
+                if flags.lock then
+                    local digest, digest_err = klua.sha256(payload)
+                    if not digest or digest_err then
+                        klua.error("could not compute SHA-256 for " .. asset.name .. ": "
+                            .. tostring(digest_err))
+                        return 1
+                    end
+                    record_lock_entry(key, "gh", version, asset.name,
+                        asset.browser_download_url, digest)
+                end
             end
+
             local store_dir = klua.paths.store .. "/gh/" .. user .. "/" .. name .. "/" .. version
             return install_payload(payload, asset.name, store_dir, name, manifest)
         end
     end
 
-    -- No release or no suitable asset: try manifest build.steps.
+    -- No release or no suitable asset: try manifest build.steps. System
+    -- dependencies are flushed before any build command runs.
     if manifest and type(manifest.build) == "table"
         and type(manifest.build.steps) == "table" and #manifest.build.steps > 0 then
-        local version = tag or "source"
+        local code = flush_system_packages()
+        if code ~= 0 then
+            return code
+        end
+        local version = resolved_tag or "source"
         local store_dir = klua.paths.store .. "/gh/" .. user .. "/" .. name .. "/" .. version
-        return build_from_source(klua.github_clone, user, name, tag, manifest, store_dir)
+        return build_from_source(klua.github_clone, user, name, resolved_tag, manifest, store_dir)
     end
 
     if not release then
@@ -1114,7 +1195,7 @@ klua.register_provider("gh", github_install)
 -- GitLab provider: gl:user/repo[@tag]
 -- ---------------------------------------------------------------------------
 
-local function gitlab_install(rest)
+local function gitlab_install(rest, target_key)
     local repo, tag = string.match(rest, "^([^@]+)@(.+)$")
     if not repo then
         repo = rest
@@ -1125,38 +1206,72 @@ local function gitlab_install(rest)
         return 1
     end
 
-    local manifest = fetch_manifest(klua.raw_gitlab, user, name, tag, "gitlab")
-
-    local project = user .. "%2F" .. name
-    local endpoint = tag and ("releases/" .. tag) or "releases/permalink/latest"
-    local api = klua.gitlab_api .. "/projects/" .. project .. "/" .. endpoint
-    local body, status, err = klua.http_get(api)
-    if err then
-        klua.error("gl: request failed: " .. err)
+    local key = target_key or ("gl:" .. repo)
+    local flags = klua.cli_flags or {}
+    local lock_entry, lock_failed = lock_entry_for(key, "gl")
+    if lock_failed then
         return 1
     end
+    if lock_entry and tag and lock_entry.version ~= tag then
+        klua.error("--locked: requested tag '" .. tag .. "' for " .. key
+            .. " but lockfile records '" .. tostring(lock_entry.version) .. "'")
+        return 1
+    end
+    local resolved_tag = tag or (lock_entry and lock_entry.version) or nil
 
     local release = nil
-    if status == 200 then
-        local json_err
-        release, json_err = klua.json_parse(body)
-        if not release then
-            klua.error("gl: could not parse release JSON: " .. tostring(json_err))
+    if lock_entry then
+        klua.info("gl: using lockfile entry for " .. repo .. " " .. lock_entry.version)
+        release = {
+            tag_name = lock_entry.version,
+            assets = {{ name = lock_entry.asset, browser_download_url = lock_entry.url }},
+        }
+    else
+        local project = user .. "%2F" .. name
+        local endpoint = resolved_tag and ("releases/" .. resolved_tag) or "releases/permalink/latest"
+        local api = klua.gitlab_api .. "/projects/" .. project .. "/" .. endpoint
+        local body, status, err = klua.http_get(api)
+        if err then
+            klua.error("gl: request failed: " .. err)
             return 1
         end
-    elseif status ~= 404 then
-        klua.error("gl: GitLab API returned HTTP " .. tostring(status))
-        return 1
+        if status == 200 then
+            local json_err
+            release, json_err = klua.json_parse(body)
+            if not release then
+                klua.error("gl: could not parse release JSON: " .. tostring(json_err))
+                return 1
+            end
+        elseif status ~= 404 then
+            klua.error("gl: GitLab API returned HTTP " .. tostring(status))
+            return 1
+        end
+    end
+
+    -- Re-read the manifest at the resolved tag so depends/settings match the
+    -- release that is actually installed.
+    local manifest = fetch_manifest(klua.raw_gitlab, user, name, resolved_tag, "gitlab")
+    if release and release.tag_name and release.tag_name ~= resolved_tag then
+        local tagged = fetch_manifest(klua.raw_gitlab, user, name, release.tag_name, "gitlab")
+        if tagged then
+            manifest = tagged
+        end
+    end
+    if manifest then
+        local code = install_dependencies(manifest)
+        if code ~= 0 then
+            return code
+        end
     end
 
     if release then
-        local version = release.tag_name or tag or "unknown"
+        local version = release.tag_name or resolved_tag or "unknown"
         -- Normalize GitLab asset links into the GitHub asset shape.
         local assets = {}
         for _, link in ipairs((release.assets and release.assets.links) or {}) do
             assets[#assets + 1] = { name = link.name or "", browser_download_url = link.url }
         end
-        local asset = select_asset(assets, manifest, klua.platform())
+        local asset = lock_entry and assets[1] or select_asset(assets, manifest, klua.platform())
         if asset then
             klua.info("gl: " .. repo .. " " .. version .. " -> " .. asset.name)
             local asset_name = basename(asset.browser_download_url or asset.name)
@@ -1166,10 +1281,29 @@ local function gitlab_install(rest)
                 klua.error("gl: download failed: " .. tostring(dl_err))
                 return 1
             end
-            local code = verify_checksum(payload, asset_name, assets, "gl:" .. repo)
-            if code ~= 0 then
-                return code
+
+            if lock_entry then
+                local code = verify_locked_digest(payload, asset_name, lock_entry, "gl:" .. repo)
+                if code ~= 0 then
+                    return code
+                end
+            else
+                local code = verify_checksum(payload, asset_name, assets, "gl:" .. repo)
+                if code ~= 0 then
+                    return code
+                end
+                if flags.lock then
+                    local digest, digest_err = klua.sha256(payload)
+                    if not digest or digest_err then
+                        klua.error("could not compute SHA-256 for " .. asset_name .. ": "
+                            .. tostring(digest_err))
+                        return 1
+                    end
+                    record_lock_entry(key, "gl", version, asset_name,
+                        asset.browser_download_url, digest)
+                end
             end
+
             local store_dir = klua.paths.store .. "/gl/" .. user .. "/" .. name .. "/" .. version
             return install_payload(payload, asset_name, store_dir, name, manifest)
         end
@@ -1177,9 +1311,13 @@ local function gitlab_install(rest)
 
     if manifest and type(manifest.build) == "table"
         and type(manifest.build.steps) == "table" and #manifest.build.steps > 0 then
-        local version = tag or "source"
+        local code = flush_system_packages()
+        if code ~= 0 then
+            return code
+        end
+        local version = resolved_tag or "source"
         local store_dir = klua.paths.store .. "/gl/" .. user .. "/" .. name .. "/" .. version
-        return build_from_source(klua.gitlab_clone, user, name, tag, manifest, store_dir)
+        return build_from_source(klua.gitlab_clone, user, name, resolved_tag, manifest, store_dir)
     end
 
     if not release then
@@ -1198,28 +1336,56 @@ klua.register_provider("gl", gitlab_install)
 -- Direct URL provider: url:https://host/path/tool.tar.gz
 -- ---------------------------------------------------------------------------
 
-local function url_install(rest)
+local function url_install(rest, target_key)
     if not string.match(rest, "^https?://") then
         klua.error("url: expected an http(s) URL, got '" .. rest .. "'")
         return 1
     end
 
-    local path_part = string.match(rest, "^https?://[^/]+(/[^?#]*)") or "/"
-    local asset_name = basename(path_part)
-    if asset_name == "" or asset_name == "/" then
-        klua.error("url: could not derive a file name from '" .. rest .. "'")
+    local key = target_key or ("url:" .. rest)
+    local flags = klua.cli_flags or {}
+    local lock_entry, lock_failed = lock_entry_for(key, "url")
+    if lock_failed then
         return 1
     end
-    local host = string.match(rest, "^https?://([^/]+)") or "unknown-host"
+    local download_url = lock_entry and lock_entry.url or rest
+    if not string.match(download_url, "^https?://") then
+        klua.error("url: lockfile entry has an invalid URL for " .. key)
+        return 1
+    end
+
+    local path_part = string.match(download_url, "^https?://[^/]+(/[^?#]*)") or "/"
+    local asset_name = lock_entry and lock_entry.asset
+        or basename(path_part)
+    if asset_name == nil or asset_name == "" or asset_name == "/" then
+        klua.error("url: could not derive a file name from '" .. download_url .. "'")
+        return 1
+    end
+    local host = string.match(download_url, "^https?://([^/]+)") or "unknown-host"
     local stem = string.gsub(asset_name, "%.[^.]+$", "")
     stem = string.gsub(stem, "%.tar$", "")
 
-    klua.info("url: downloading " .. rest)
+    klua.info("url: downloading " .. download_url)
     local payload = klua.paths.cache .. "/downloads/" .. asset_name
-    local ok, dl_err = klua.download(rest, payload)
+    local ok, dl_err = klua.download(download_url, payload)
     if not ok then
         klua.error("url: download failed: " .. tostring(dl_err))
         return 1
+    end
+
+    if lock_entry then
+        local code = verify_locked_digest(payload, asset_name, lock_entry, "url")
+        if code ~= 0 then
+            return code
+        end
+    elseif flags.lock then
+        local digest, digest_err = klua.sha256(payload)
+        if not digest or digest_err then
+            klua.error("could not compute SHA-256 for " .. asset_name .. ": "
+                .. tostring(digest_err))
+            return 1
+        end
+        record_lock_entry(key, "url", "direct", asset_name, download_url, digest)
     end
 
     local store_dir = klua.paths.store .. "/url/" .. host .. "/" .. stem .. "/direct"
@@ -1229,13 +1395,291 @@ end
 klua.register_provider("url", url_install)
 
 -- ---------------------------------------------------------------------------
--- apt provider: delegated to the system package manager (later milestone).
+-- System package delegation (sys: and klua.yaml depends:)
+--
+-- Package names are validated and shell-quoted. Installation is idempotent:
+-- status is checked first, and every missing package from one klua invocation
+-- is installed with a single manager command instead of one sudo per package.
 -- ---------------------------------------------------------------------------
 
-klua.register_provider("apt", function(rest)
-    klua.warn("apt: installing '" .. rest .. "' via the system package manager is not implemented yet.")
-    return 1
-end)
+local SYSTEM_SCHEMES = {
+    apt = true, ["apt-get"] = true, dnf = true, yum = true,
+    pacman = true, apk = true, brew = true, sys = true,
+}
+
+local SYSTEM_MANAGERS = {
+    apt = {
+        probe = "dpkg-query",
+        status = function(pkg)
+            return "dpkg-query -W -f='${Status}' " .. shq(pkg)
+                .. " 2>/dev/null | grep -qx 'install ok installed'"
+        end,
+        install = "apt-get install -y -- %s",
+        install_bin = "apt-get",
+    },
+    dnf = {
+        probe = "dnf",
+        status = function(pkg) return "rpm -q " .. shq(pkg) .. " >/dev/null 2>&1" end,
+        install = "dnf install -y %s",
+        install_bin = "dnf",
+    },
+    yum = {
+        probe = "yum",
+        status = function(pkg) return "rpm -q " .. shq(pkg) .. " >/dev/null 2>&1" end,
+        install = "yum install -y %s",
+        install_bin = "yum",
+    },
+    pacman = {
+        probe = "pacman",
+        status = function(pkg) return "pacman -Q " .. shq(pkg) .. " >/dev/null 2>&1" end,
+        install = "pacman -S --noconfirm -- %s",
+        install_bin = "pacman",
+    },
+    apk = {
+        probe = "apk",
+        status = function(pkg) return "apk info -e " .. shq(pkg) .. " >/dev/null 2>&1" end,
+        install = "apk add %s",
+        install_bin = "apk",
+    },
+    brew = {
+        probe = "brew",
+        status = function(pkg) return "brew list " .. shq(pkg) .. " >/dev/null 2>&1" end,
+        install = "brew install %s",
+        install_bin = "brew",
+    },
+}
+
+local system_queue = {}
+local system_seen = {}
+
+local function detect_system_manager()
+    local configured = klua.system.manager
+    if configured ~= nil then
+        if type(configured) == "string" and configured ~= "" then
+            local lower = string.lower(configured)
+            local has_custom_hooks = type(klua.system.status) == "function"
+                and type(klua.system.install) == "function"
+            if not SYSTEM_MANAGERS[lower] and not has_custom_hooks then
+                klua.error("unknown system package manager '" .. configured .. "'")
+                return nil
+            end
+            return lower
+        end
+        klua.error("klua.system.manager must be a non-empty string")
+        return nil
+    end
+    for _, name in ipairs({"apt", "dnf", "yum", "pacman", "apk", "brew"}) do
+        local spec = SYSTEM_MANAGERS[name]
+        if klua.exec("command -v " .. spec.probe .. " >/dev/null 2>&1") == 0 then
+            return name
+        end
+    end
+    klua.error("could not detect a supported system package manager; "
+        .. "set klua.system.manager in init.lua")
+    return nil
+end
+
+local function parse_system_packages(rest)
+    local packages, seen = {}, {}
+    local normalized = string.gsub(tostring(rest or ""), ",", " ")
+    for name in string.gmatch(normalized, "%S+") do
+        if not string.match(name, "^[%w][%w.+_:-]*$") then
+            klua.error("invalid system package name '" .. name .. "'")
+            return nil
+        end
+        if not seen[name] then
+            seen[name] = true
+            packages[#packages + 1] = name
+        end
+    end
+    if #packages == 0 then
+        klua.error("sys: expected one or more package names")
+        return nil
+    end
+    return packages
+end
+
+local function system_package_installed(manager, pkg)
+    if type(klua.system.status) == "function" then
+        local result = klua.system.status(pkg)
+        return result == true or result == 0
+    end
+    if type(klua.system.status_cmd) == "string" then
+        return klua.exec(string.format(klua.system.status_cmd, shq(pkg))) == 0
+    end
+    return klua.exec(SYSTEM_MANAGERS[manager].status(pkg)) == 0
+end
+
+local function sudo_prefix(manager)
+    if manager == "brew" then
+        return ""
+    end
+    if klua.exec("id -u") == 0 then
+        return ""
+    end
+    if klua.exec("command -v sudo >/dev/null 2>&1") == 0 then
+        return "sudo "
+    end
+    klua.warn("not root and sudo is unavailable; system install may fail")
+    return ""
+end
+
+local function install_system_batch(manager, packages)
+    if type(klua.system.install) == "function" then
+        local result = klua.system.install(packages)
+        return result == true and 0 or (type(result) == "number" and result or 1)
+    end
+    if type(klua.system.install_cmd) == "string" then
+        local quoted = {}
+        for _, pkg in ipairs(packages) do
+            quoted[#quoted + 1] = shq(pkg)
+        end
+        return klua.exec(string.format(klua.system.install_cmd, table.concat(quoted, " ")))
+    end
+    local spec = SYSTEM_MANAGERS[manager]
+    local quoted = {}
+    for _, pkg in ipairs(packages) do
+        quoted[#quoted + 1] = shq(pkg)
+    end
+    local prefix = sudo_prefix(manager)
+    if spec.install_bin and klua.exec("command -v " .. spec.install_bin .. " >/dev/null 2>&1") ~= 0 then
+        klua.error("system package manager '" .. spec.install_bin .. "' is not available")
+        return 1
+    end
+    local command = prefix .. string.format(spec.install, table.concat(quoted, " "))
+    klua.info("sys: " .. command)
+    return klua.exec(command)
+end
+
+local function queue_system_packages(packages)
+    local added = 0
+    for _, pkg in ipairs(packages) do
+        if not system_seen[pkg] then
+            system_seen[pkg] = true
+            system_queue[#system_queue + 1] = pkg
+            added = added + 1
+        end
+    end
+    return added
+end
+
+flush_system_packages = function()
+    if #system_queue == 0 then
+        return 0
+    end
+    local queued = system_queue
+    system_queue = {}
+    local manager = detect_system_manager()
+    if not manager then
+        return 1
+    end
+
+    local missing = {}
+    for _, pkg in ipairs(queued) do
+        if system_package_installed(manager, pkg) then
+            klua.info("sys: '" .. pkg .. "' is already installed")
+        else
+            missing[#missing + 1] = pkg
+        end
+    end
+
+    if #missing == 0 then
+        klua.info("sys: all " .. #queued .. " requested package(s) are already installed")
+        return 0
+    end
+
+    klua.info("sys: installing " .. #missing .. " missing package(s) with " .. manager
+        .. ": " .. table.concat(missing, ", "))
+    if install_system_batch(manager, missing) ~= 0 then
+        klua.error("sys: failed to install package(s): " .. table.concat(missing, ", "))
+        return 1
+    end
+
+    local failed = {}
+    for _, pkg in ipairs(missing) do
+        if not system_package_installed(manager, pkg) then
+            failed[#failed + 1] = pkg
+        end
+    end
+    if #failed > 0 then
+        klua.warn("sys: package(s) still not available after install: " .. table.concat(failed, ", "))
+        return 1
+    end
+    klua.info("sys: installed " .. #missing .. " package(s)")
+    return 0
+end
+
+local function system_install(rest)
+    local packages = parse_system_packages(rest)
+    if not packages then
+        return 1
+    end
+    queue_system_packages(packages)
+    return 0
+end
+
+klua.register_provider("sys", system_install)
+for _, scheme in ipairs({"apt", "apt-get", "dnf", "yum", "pacman", "apk", "brew"}) do
+    klua.register_provider(scheme, system_install)
+end
+
+-- Manifest `depends:` entries: plain names and sys:/apt: aliases are batched;
+-- other targets are installed through their own provider.
+local function manifest_dependency_list(manifest)
+    local value = manifest and manifest.depends
+    local items = {}
+    if type(value) == "string" then
+        items[1] = value
+    elseif type(value) == "table" then
+        if value[1] ~= nil then
+            for _, item in ipairs(value) do
+                if type(item) == "string" then
+                    items[#items + 1] = item
+                elseif type(item) == "table" and type(item.target) == "string" then
+                    items[#items + 1] = item.target
+                end
+            end
+        else
+            for _, key in ipairs({"system", "packages"}) do
+                local group = value[key]
+                if type(group) == "string" then
+                    items[#items + 1] = group
+                elseif type(group) == "table" then
+                    for _, item in ipairs(group) do
+                        if type(item) == "string" then
+                            items[#items + 1] = item
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return items
+end
+
+install_dependencies = function(manifest)
+    local opts = klua.install_opts or {}
+    opts._dependency_seen = opts._dependency_seen or {}
+    for _, item in ipairs(manifest_dependency_list(manifest)) do
+        local scheme = string.match(item, "^([%w][%w+_-]*):")
+        if not scheme or SYSTEM_SCHEMES[scheme] then
+            local packages = parse_system_packages(scheme and string.match(item, "^[%w][%w+_-]*:(.+)$") or item)
+            if not packages then
+                return 1
+            end
+            queue_system_packages(packages)
+        else
+            if not opts._dependency_seen[item] then
+                opts._dependency_seen[item] = true
+                local code = install_one(item)
+                if code ~= 0 then
+                    return code
+                end
+            end
+        end
+    end
+    return 0
+end
 
 -- ---------------------------------------------------------------------------
 -- Install dispatch
@@ -1261,6 +1705,13 @@ local function install_one(target)
     if not provider then
         klua.error("no provider registered for scheme '" .. scheme .. "'")
         return 1
+    end
+    if (klua.cli_flags or {}).locked and scheme ~= "sys"
+        and not SYSTEM_SCHEMES[scheme] then
+        local _, failed = lock_entry_for(target)
+        if failed then
+            return 1
+        end
     end
     local ok, result = pcall(provider, rest, target)
     if not ok then
@@ -1402,10 +1853,185 @@ local function save_packages_file(includes, packages)
 end
 
 -- ---------------------------------------------------------------------------
+-- Reproducible lockfile (packages.lock.yaml)
+--
+-- The lockfile maps a canonical scheme target to the exact resolution used by
+-- a successful install: version/tag, selected asset, its URL and SHA-256.
+-- `--lock` records those values; `--locked` requires them and never performs
+-- fresh release discovery.
+-- ---------------------------------------------------------------------------
+
+local function canonical_lock_target(target)
+    local scheme, rest = string.match(target, "^([%w][%w+_-]*):(.+)$")
+    if scheme == "gh" or scheme == "gl" then
+        local repo = string.match(rest, "^([^@]+)") or rest
+        return scheme .. ":" .. repo
+    end
+    return target
+end
+
+local function load_lockfile()
+    if klua.lockfile.loaded then
+        return true
+    end
+    local entries = {}
+    if klua.file_exists(klua.paths.lock) then
+        local content = klua.read_file(klua.paths.lock) or ""
+        local doc, parse_err = klua.yaml_parse(content)
+        if parse_err then
+            klua.error("could not parse " .. klua.paths.lock .. ": " .. tostring(parse_err))
+            return false
+        end
+        if type(doc) == "table" and type(doc.entries) == "table" then
+            for key, entry in pairs(doc.entries) do
+                if type(key) == "string" and type(entry) == "table" then
+                    entries[key] = entry
+                end
+            end
+        end
+    end
+    klua.lockfile.entries = entries
+    klua.lockfile.loaded = true
+    return true
+end
+
+local function require_lockfile()
+    if not klua.file_exists(klua.paths.lock) then
+        klua.error("no " .. klua.paths.lock .. " found; run with --lock first")
+        return false
+    end
+    return load_lockfile()
+end
+
+local function valid_sha256(value)
+    return type(value) == "string" and string.match(value, "^%x+$") ~= nil and #value == 64
+end
+
+lock_entry_for = function(target, provider)
+    local flags = klua.cli_flags or {}
+    if not flags.locked then
+        return nil
+    end
+    if not load_lockfile() then
+        return nil
+    end
+    local key = canonical_lock_target(target)
+    local entry = klua.lockfile.entries[key]
+    if not entry then
+        klua.error("--locked: no lock entry for '" .. key .. "' in " .. klua.paths.lock)
+        return nil, true
+    end
+    if provider and entry.provider ~= provider then
+        klua.error("--locked: '" .. key .. "' is locked to provider '"
+            .. tostring(entry.provider) .. "', not '" .. provider .. "'")
+        return nil, true
+    end
+    if not valid_sha256(entry.sha256) then
+        klua.error("--locked: invalid sha256 for '" .. key .. "'")
+        return nil, true
+    end
+    if type(entry.url) ~= "string" or entry.url == "" then
+        klua.error("--locked: missing asset URL for '" .. key .. "'")
+        return nil, true
+    end
+    return entry
+end
+
+record_lock_entry = function(target, provider, version, asset, url, sha256)
+    local flags = klua.cli_flags or {}
+    if not flags.lock then
+        return
+    end
+    if not load_lockfile() then
+        return
+    end
+    if not valid_sha256(sha256) then
+        klua.warn("not locking '" .. target .. "': invalid SHA-256 digest")
+        return
+    end
+    local key = canonical_lock_target(target)
+    klua.lockfile.entries[key] = {
+        provider = provider,
+        version = tostring(version or ""),
+        asset = tostring(asset or ""),
+        url = tostring(url or ""),
+        sha256 = string.lower(sha256),
+    }
+end
+
+local function save_lockfile()
+    local flags = klua.cli_flags or {}
+    if not flags.lock then
+        return 0
+    end
+    if not load_lockfile() then
+        return 1
+    end
+    local keys = {}
+    for key in pairs(klua.lockfile.entries) do
+        keys[#keys + 1] = key
+    end
+    table.sort(keys)
+    local lines = {
+        "# Generated by klua sync/install --lock; do not edit by hand.",
+        "version: 1",
+        "entries:",
+    }
+    for _, key in ipairs(keys) do
+        local entry = klua.lockfile.entries[key]
+        lines[#lines + 1] = "  " .. yaml_quote(key) .. ":"
+        lines[#lines + 1] = "    provider: " .. yaml_quote(tostring(entry.provider or ""))
+        lines[#lines + 1] = "    version: " .. yaml_quote(tostring(entry.version or ""))
+        lines[#lines + 1] = "    asset: " .. yaml_quote(tostring(entry.asset or ""))
+        lines[#lines + 1] = "    url: " .. yaml_quote(tostring(entry.url or ""))
+        lines[#lines + 1] = "    sha256: " .. yaml_quote(tostring(entry.sha256 or ""))
+    end
+    local ok, err = klua.write_file(klua.paths.lock, table.concat(lines, "\n") .. "\n")
+    if not ok then
+        klua.error("could not write " .. klua.paths.lock .. ": " .. tostring(err))
+        return 1
+    end
+    klua.info("lockfile updated: " .. klua.paths.lock)
+    return 0
+end
+
+verify_locked_digest = function(payload, asset_name, entry, label)
+    local flags = klua.cli_flags or {}
+    if flags.skip_checksum then
+        klua.warn("checksum verification skipped via --skip-checksum for " .. asset_name)
+        return 0
+    end
+    local actual, err = klua.sha256(payload)
+    if not actual or err then
+        klua.error("could not compute SHA-256 for " .. asset_name .. ": " .. tostring(err))
+        return 1
+    end
+    if string.lower(actual) ~= string.lower(entry.sha256) then
+        klua.error("SHA-256 mismatch for " .. asset_name .. ": expected "
+            .. entry.sha256 .. ", got " .. string.lower(actual) .. " (lockfile " .. label .. ")")
+        return 1
+    end
+    klua.info("sha256 verified for " .. asset_name .. " (lockfile)")
+    return 0
+end
+
+-- Custom providers can opt into the same lockfile policy by calling these
+-- helpers with their resolved version, asset URL and digest.
+klua.lockfile.require = require_lockfile
+klua.lockfile.get = lock_entry_for
+klua.lockfile.record = record_lock_entry
+klua.lockfile.verify = verify_locked_digest
+klua.lockfile.save = save_lockfile
+
+-- ---------------------------------------------------------------------------
 -- Command handlers
 -- ---------------------------------------------------------------------------
 
 function klua.commands.install(args)
+    local flags = klua.cli_flags or {}
+    if flags.locked and not require_lockfile() then
+        return 1
+    end
     local force = false
     local as_name = nil
     local targets = {}
@@ -1427,7 +2053,7 @@ function klua.commands.install(args)
         index = index + 1
     end
     if #targets == 0 then
-        klua.error("usage: klua install [--force] [--as NAME] <target> [<target>...]")
+        klua.error("usage: klua install [--force] [--as NAME] [--lock|--locked] <target> [<target>...]")
         return 1
     end
     if as_name then
@@ -1443,12 +2069,22 @@ function klua.commands.install(args)
     end
 
     local saved = klua.install_opts
-    klua.install_opts = { force = force, link = true, as = as_name }
+    klua.install_opts = { force = force, link = true, as = as_name, _dependency_seen = {} }
     local status = 0
     for _, target in ipairs(targets) do
         local code = install_one(target)
         if code ~= 0 then
             status = code
+        end
+    end
+    local system_status = flush_system_packages()
+    if system_status ~= 0 and status == 0 then
+        status = system_status
+    end
+    if status == 0 then
+        local lock_status = save_lockfile()
+        if lock_status ~= 0 then
+            status = lock_status
         end
     end
     klua.install_opts = saved
@@ -1745,8 +2381,11 @@ function klua.commands.run(args)
     if not dir then
         klua.info("installing '" .. target .. "' for this run (store only, no links)")
         local saved = klua.install_opts
-        klua.install_opts = { force = false, link = false }
+        klua.install_opts = { force = false, link = false, _dependency_seen = {} }
         local code = install_one(resolved)
+        if code == 0 then
+            code = flush_system_packages()
+        end
         klua.install_opts = saved
         if code ~= 0 then
             return code
@@ -2228,6 +2867,10 @@ local function collect_packages(source, base_dir, visited, out)
 end
 
 function klua.commands.sync(args)
+    local flags = klua.cli_flags or {}
+    if flags.locked and not require_lockfile() then
+        return 1
+    end
     local source = args[1] or klua.paths.packages
     if not args[1] and not klua.file_exists(source) then
         klua.error("no packages.yaml found; add targets with 'klua add <target>' first")
@@ -2244,6 +2887,8 @@ function klua.commands.sync(args)
         return 0
     end
 
+    local saved = klua.install_opts
+    klua.install_opts = { force = false, link = true, _dependency_seen = {} }
     klua.info("syncing " .. #packages .. " package(s)")
     local failed = 0
     for _, target in ipairs(packages) do
@@ -2251,6 +2896,13 @@ function klua.commands.sync(args)
             failed = failed + 1
         end
     end
+    if flush_system_packages() ~= 0 then
+        failed = failed + 1
+    end
+    if failed == 0 and save_lockfile() ~= 0 then
+        failed = failed + 1
+    end
+    klua.install_opts = saved
     if failed > 0 then
         klua.error("sync finished with " .. failed .. " failure(s)")
         return 1
@@ -2260,6 +2912,11 @@ function klua.commands.sync(args)
 end
 
 function klua.commands.upgrade(args)
+    local flags = klua.cli_flags or {}
+    if flags.locked then
+        klua.error("--locked cannot be combined with 'upgrade'; use 'klua sync --locked'")
+        return 1
+    end
     local targets = {}
     if #args > 0 then
         for _, target in ipairs(args) do
@@ -2289,6 +2946,8 @@ function klua.commands.upgrade(args)
         end
     end
 
+    local saved = klua.install_opts
+    klua.install_opts = { force = false, link = true, _dependency_seen = {} }
     local status = 0
     for _, target in ipairs(targets) do
         local before = current_version(target)
@@ -2305,6 +2964,13 @@ function klua.commands.upgrade(args)
             end
         end
     end
+    if flush_system_packages() ~= 0 then
+        status = 1
+    end
+    if status == 0 and save_lockfile() ~= 0 then
+        status = 1
+    end
+    klua.install_opts = saved
     return status
 end
 

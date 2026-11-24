@@ -1,0 +1,2 @@
+# Aliases starting with "s". Format: alias: scheme-target
+starship: gh:starship/starship

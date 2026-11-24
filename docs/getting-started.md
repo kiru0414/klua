@@ -19,8 +19,8 @@ Static Linux binaries (x86_64, arm64) and macOS binaries are attached to
 every `v*` release:
 
 ```sh
-curl -LO https://github.com/kiru0414/klua/releases/latest/download/klua-v0.5.0-linux-x86_64.tar.gz
-tar -xzf klua-v0.5.0-linux-x86_64.tar.gz
+curl -LO https://github.com/kiru0414/klua/releases/latest/download/klua-v0.6.0-linux-x86_64.tar.gz
+tar -xzf klua-v0.6.0-linux-x86_64.tar.gz
 install -m 755 klua ~/.local/bin/klua   # or /usr/local/bin
 klua --version
 ```
@@ -61,7 +61,7 @@ On Windows, build inside WSL — POSIX is the only supported target.
 
 | Purpose | Default | Override |
 | ------- | ------- | -------- |
-| Config  | `~/.config/klua/` (`init.lua`, `packages.yaml`, `taps.yaml`) | `XDG_CONFIG_HOME` |
+| Config  | `~/.config/klua/` (`init.lua`, `packages.yaml`, `packages.lock.yaml`, `taps.yaml`) | `XDG_CONFIG_HOME` |
 | Store   | `~/.local/share/klua/store/<provider>/<user>/<repo>/<version>/` | `XDG_DATA_HOME` |
 | Bin     | `~/.local/bin/<name>` (symlinks into the store) | none (always `~/.local/bin`) |
 | Cache   | `~/.cache/klua/` (`downloads/`, `checksums/`, `build/`, `shards/`) | `XDG_CACHE_HOME` |
@@ -79,13 +79,15 @@ relative layouts of complex tools survive.
 - **Automatic PATH conflict protection:** klua scans `PATH`, skips/warns on
   collisions, protects core commands, and offers `--force` / `--as` instead of
   silently overwriting your system.
+- **Reproducible installs:** `sync --lock` records versions, URLs and digests;
+  `sync --locked` reuses them without release discovery and refuses mismatches.
 - **Self-evolving Lua customization:** `init.lua` can replace providers and
   command handlers; the embedded baseline is always the safe fallback.
 
 ## CLI
 
 ```
-klua install [--force] [--as NAME] [--no-cache] [--skip-checksum] <target>...  (alias: klua i)
+klua install [--force] [--as NAME] [--no-cache] [--skip-checksum] [--lock|--locked] <target>...  (alias: klua i)
 klua run [--no-cache] [--skip-checksum] <target> [--] [args...]  # store-only
 klua search [--no-cache] <query>
 klua info [--no-cache] <target>
@@ -93,8 +95,8 @@ klua cleanup [--no-cache]
 klua doctor [--no-cache]
 klua add <target>...
 klua remove [--no-cache] <target>...    (aliases: klua rm, klua uninstall)
-klua sync [--no-cache] [--skip-checksum] [path_or_url]
-klua upgrade [--no-cache] [--skip-checksum] [target...]
+klua sync [--no-cache] [--skip-checksum] [--lock|--locked] [path_or_url]
+klua upgrade [--no-cache] [--skip-checksum] [--lock] [target...]
 klua tap <add|remove|list> [url]
 klua list
 klua repair [--dry-run|--diff]
@@ -105,7 +107,7 @@ klua --version | --help
 Mistyped subcommands, flags, and aliases get a Levenshtein-based hint. The
 suggestion dictionary includes `install`, `run`, `search`, `info`, `cleanup`,
 `doctor`, `remove`/`rm`/`uninstall`, and flags such as `--force`, `--as`,
-`--no-cache`, `--skip-checksum`, `--dry-run` and `--diff`:
+`--no-cache`, `--skip-checksum`, `--lock`, `--locked`, `--dry-run` and `--diff`:
 
 ```
 $ klua instll
@@ -127,14 +129,17 @@ klua install gh:jqlang/jq        # GitHub Releases (latest)
 klua i gh:jqlang/jq@jq-1.7.1     # pinned tag
 klua install gl:user/repo        # GitLab Releases
 klua install url:https://example.com/tool.tar.gz
+klua install sys:git,curl        # install missing system packages in one batch
+klua install apt:jq              # same delegation with an explicit manager
 klua install fd                  # alias -> v1/f.yaml -> gh:sharkdp/fd
 ```
 
-Pipeline: direct scheme dispatch, or alias sharding lookup, then (for
-gh/gl) an in-repo [`klua.yaml`](klua-yaml.md) manifest check, then release
-discovery (API-free for `gh:`), asset scoring by OS/arch, download, SHA-256
-verification, extraction into the store, binary discovery (ELF/Mach-O magic
-or exec bits), `chmod +x`, conflict-checked symlink into `~/.local/bin`. See
+Pipeline: direct scheme dispatch, or alias sharding lookup, then (for gh/gl)
+release discovery (API-free for `gh:`) and an in-repo
+[`klua.yaml`](klua-yaml.md) check at the resolved tag, followed by asset
+scoring by OS/arch, download, SHA-256 verification, extraction into the store,
+binary discovery (ELF/Mach-O magic or exec bits), `chmod +x`, conflict-checked
+symlink into `~/.local/bin`. See
 [taps-and-registry.md](taps-and-registry.md) for alias resolution and the
 sections below for release discovery, caching and checksums.
 
@@ -153,6 +158,13 @@ The REST API is still used if the web endpoints fail. When the fallback runs,
 `Authorization: Bearer ...`. For a trusted custom API host, set
 `KLUA_GITHUB_API_HOST` to that hostname; the token is then limited to
 API-looking paths on that host.
+
+GitLab releases use `klua.gitlab_api` directly. When `GITLAB_TOKEN` is set,
+requests to GitLab API endpoints receive both `PRIVATE-TOKEN` and
+`Authorization: Bearer ...`. For a self-hosted instance set
+`KLUA_GITLAB_API_HOST` to its hostname. In both cases tokens are only attached
+to API-looking paths (`/api/...` or `/repos/...`); raw files and asset
+downloads never receive them.
 
 ### Registry shard cache
 
@@ -184,6 +196,59 @@ klua install --skip-checksum gh:jqlang/jq  # explicit bypass, warns and continue
 GitLab releases go through the same verification path. Registries and
 checksum files themselves are not signed; this protects against truncated or
 corrupted downloads, not maliciously published checksums.
+
+### System package delegation
+
+`sys:pkg1,pkg2,...` and the explicit manager schemes (`apt:`, `apt-get:`,
+`dnf:`, `yum:`, `pacman:`, `apk:`, `brew:`) delegate to the host package
+manager. klua checks each package's installed status first, skips anything
+already present, and queues the rest. Every missing package from one CLI
+invocation is installed with **one** manager command (`sudo apt-get install -y
+...` on Debian/Ubuntu, `brew install ...` on macOS, etc.) instead of spawning
+`sudo` once per package. A package listed in a manifest's
+[`depends:`](klua-yaml.md#depends) uses the same queue.
+
+```sh
+klua install sys:git,curl,wget   # one batch; already-installed packages skipped
+klua install apt:jq              # force a particular manager scheme
+```
+
+The manager is detected at runtime from `dpkg-query`, `dnf`, `yum`, `pacman`,
+`apk` and `brew`. In `init.lua`, set `klua.system.manager` to override it, or
+provide `klua.system.status(pkg)` / `klua.system.install(pkgs)` hooks for
+custom environments. See [lua-api.md](lua-api.md#system-package-delegation).
+
+### Locked installs
+
+`packages.lock.yaml` lives beside `packages.yaml` in the config directory and
+records the exact provider, version, asset URL and SHA-256 for every resolved
+target:
+
+```yaml
+version: 1
+entries:
+  gh:jqlang/jq:
+    provider: gh
+    version: jq-1.7.1
+    asset: jq-linux-amd64
+    url: https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64
+    sha256: 0123456789abcdef...
+```
+
+```sh
+klua sync --lock      # resolve normally, then write/update the lockfile
+klua sync --locked    # require the lockfile; install exactly what it records
+klua install --locked gh:jqlang/jq
+```
+
+With `--locked`, klua refuses to run without a lockfile or if a target is
+missing from it. It skips latest-tag redirects, release pages and REST API
+calls, downloads the recorded URL, and verifies the recorded digest before
+extraction. A tag that disagrees with the locked version, a changed URL, or a
+hash mismatch fails the install. `--locked` is mutually exclusive with
+`--lock` and `--skip-checksum`. `upgrade --lock` refreshes entries;
+`upgrade --locked` is rejected because upgrading is the opposite of a locked
+reproduction. System packages and custom schemes are not locked.
 
 ### Conflict safety
 
@@ -257,11 +322,14 @@ klua add gh:jqlang/jq fd         # record targets in packages.yaml (deduped)
 klua sync                        # install everything in packages.yaml
 klua sync ./dotfiles.yaml        # explicit local source
 klua sync https://host/set.yaml  # remote source; follows includes:
+klua sync --lock                 # write versions/URLs/digests to the lockfile
+klua sync --locked               # reproduce exactly from the lockfile
 ```
 
 `packages.yaml` supports `includes:` (recursive, cycle-safe) and
 `packages:`; duplicate targets are installed once. A bare YAML list is
-also accepted as a source.
+also accepted as a source. See [Locked installs](#locked-installs) for lock
+semantics.
 
 ### upgrade
 
@@ -271,7 +339,8 @@ klua upgrade gh:jqlang/jq        # one target (aliases resolved too)
 ```
 
 Reinstalls the latest release and reports `upgraded X: old -> new` or
-`X is up to date (version)`.
+`X is up to date (version)`. Add `--lock` to refresh locked entries for the
+newly resolved versions.
 
 ### tap / list
 

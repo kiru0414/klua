@@ -35,8 +35,8 @@ public:
     int run_command(const std::string& name, const std::vector<std::string>& args);
 
     // Publish CLI-wide switches to the Lua layer after bootstrap, so command
-    // handlers can honour --no-cache and --skip-checksum.
-    void set_cli_flags(bool no_cache, bool skip_checksum);
+    // handlers can honour cache, checksum and lockfile policy.
+    void set_cli_flags(bool no_cache, bool skip_checksum, bool locked, bool lock);
 
 private:
     void bind_natives();

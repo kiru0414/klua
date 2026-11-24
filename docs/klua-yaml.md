@@ -37,6 +37,10 @@ comment-only, klua silently falls back to asset scoring.
   `.sha256`, `.sha256sum` or `checksums.txt` before extraction. Use
   `--skip-checksum` for an explicit bypass; use `--no-cache` to refetch alias
   shards rather than the one-hour cached copy.
+- v0.6.0 adds `depends:` for system-package delegation. Missing packages are
+  collected from the whole invocation and installed in one manager command;
+  already-installed packages are skipped. `--lock` / `--locked` record and
+  reproduce resolved versions, URLs and digests in `packages.lock.yaml`.
 - Custom Lua in `init.lua` can override the provider or command handlers that
   consume manifests. `klua repair` backs up your `init.lua` to
   `init.lua.bak.<timestamp>` before restoring the baseline; preview with
@@ -54,6 +58,11 @@ klua init-manifest --force    # overwrite
 All fields are optional. Unknown fields are ignored.
 
 ```yaml
+depends:                     # system packages (batched) or other targets
+  - git
+  - sys:curl
+  - gh:jqlang/jq
+
 assets:                      # list of glob patterns
   - "mytool-*-linux-*.tar.gz"
 
@@ -139,6 +148,36 @@ configs:
   basename is appended).
 - Parent directories are created; existing files are overwritten.
 - A missing `src` fails the install.
+
+## depends
+
+System packages required by the tool. Entries without a scheme, or with a
+system scheme (`sys:`, `apt:`, `apt-get:`, `dnf:`, `yum:`, `pacman:`, `apk:`,
+`brew:`), are validated, deduplicated and queued for **one** installer command:
+
+```yaml
+depends:
+  - git
+  - sys:curl,wget
+  - brew:jq
+  - target: gh:jqlang/jq    # non-system target, installed via its own provider
+  - system:                 # grouped form is also supported
+      - ca-certificates
+      - openssl
+```
+
+- Package status is checked with the detected manager before anything is
+  queued, so already-installed packages are reported and skipped.
+- All missing packages across the manifest and the command line are installed
+  together, once per `klua` invocation. For source builds the batch is flushed
+  before the first `build.steps` command runs.
+- Non-system targets (for example `gh:user/repo` or a bare alias) are installed
+  through their normal providers and deduplicated per invocation.
+- `klua.system.manager`, `klua.system.status(pkg)` and
+  `klua.system.install(pkgs)` can override detection and commands in
+  `init.lua`; see [lua-api.md](lua-api.md#system-package-delegation).
+- A failed system install fails the overall install; system packages are not
+  recorded in `packages.lock.yaml`.
 
 ## build.steps
 

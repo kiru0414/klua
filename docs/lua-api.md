@@ -37,14 +37,16 @@ primitives below.
 
 | Name | Type | Meaning |
 | ---- | ---- | ------- |
-| `klua.version` | string | klua version, e.g. `"0.5.0"` |
-| `klua.paths` | table | `config`, `store`, `bin`, `cache`, `shards`, `init`, `packages`, `taps` (absolute path strings) |
+| `klua.version` | string | klua version, e.g. `"0.6.0"` |
+| `klua.paths` | table | `config`, `store`, `bin`, `cache`, `shards`, `init`, `packages`, `lock`, `taps` (absolute path strings) |
 | `klua.providers` | table | scheme -> `function(rest, target)` |
 | `klua.commands` | table | command name -> `function(args)` returning an exit code |
 | `klua.install_opts` | table | install-time flags: `force` (override link guards), `link` (`false` = store-only install), `as` (primary link name from `--as`) |
 | `klua.registries` | array | registry base URLs for alias sharding (defaults to the official registry) |
 | `klua.shard_ttl` | number | registry shard cache lifetime in seconds (default `3600`); `0` disables reuse |
-| `klua.cli_flags` | table | `no_cache` / `skip_checksum`, published from CLI switches before dispatch |
+| `klua.cli_flags` | table | `no_cache`, `skip_checksum`, `locked`, `lock`, published from CLI switches before dispatch |
+| `klua.system` | table | system package delegation overrides: `manager`, `status`, `install` |
+| `klua.lockfile` | table | parsed `packages.lock.yaml` state (`entries`, `loaded`) and lock helpers |
 
 ### Service endpoint overrides
 
@@ -64,6 +66,11 @@ klua.gitlab_clone = "https://gitlab.com"              -- git clone base (build.s
 the REST fallback talks to `api.github.com`. Set `KLUA_GITHUB_API_HOST` to a
 trusted custom hostname to enable the same header for API paths on that host
 (raw files and downloads never receive it).
+
+`GITLAB_TOKEN` is sent as `PRIVATE-TOKEN` and `Authorization: Bearer` on
+GitLab API requests. Set `KLUA_GITLAB_API_HOST` for a self-hosted instance.
+Custom hosts only receive tokens on API-looking paths (`/api/...` or
+`/repos/...`), never on manifest, raw-file or asset-download requests.
 
 ## Logging
 
@@ -124,6 +131,8 @@ local ok, err = klua.download("https://host/tool.tar.gz", "/path/dest")
   `Location` header, used by the baseline for API-free tag discovery.
 - Sends `User-Agent: klua/<version>`. Requests to `api.github.com` also send
   `Authorization: Bearer <token>` when `GITHUB_TOKEN` or `GH_TOKEN` is set.
+  GitLab API requests send `PRIVATE-TOKEN` and Bearer auth when
+  `GITLAB_TOKEN` is set.
 - `download` streams to disk, creates parent dirs, accepts only HTTP 200,
   and removes partial files on failure.
 - Transient failures (`403`, `429`, `5xx`, dropped connections — common with
@@ -145,7 +154,81 @@ downloaded payload before extraction when the release contains
 `SHA256(<filename>) = <hash>`, and bare digests in asset-specific sidecars.
 A mismatch produces `SHA-256 mismatch for <asset>` and an exit code of `1`
 before any store files are written. `klua.cli_flags.skip_checksum` (from
-`--skip-checksum`) bypasses verification with a warning.
+`--skip-checksum`) bypasses verification with a warning. A locked install
+instead verifies the digest recorded in `packages.lock.yaml` and ignores
+release checksum sidecars; see [Lockfile](#lockfile).
+
+## System package delegation
+
+The baseline implements `sys:` and the manager-specific schemes
+(`apt:`, `apt-get:`, `dnf:`, `yum:`, `pacman:`, `apk:`, `brew:`) by queueing
+packages for a single install batch. Status is checked before queuing, and
+duplicate names are removed. The default manager is detected from the tools
+available at runtime:
+
+| Manager | Status probe | Install command |
+| ------- | ------------ | --------------- |
+| `apt` | `dpkg-query -W -f='${Status}' <pkg>` | `apt-get install -y -- <pkgs>` |
+| `dnf` / `yum` | `rpm -q <pkg>` | `dnf install -y <pkgs>` / `yum install -y <pkgs>` |
+| `pacman` | `pacman -Q <pkg>` | `pacman -S --noconfirm -- <pkgs>` |
+| `apk` | `apk info -e <pkg>` | `apk add <pkgs>` |
+| `brew` | `brew list <pkg>` | `brew install <pkgs>` |
+
+All commands go through the shell with single-quote escaping, and `sudo` is
+prepended once for the whole batch when the process is not root (never for
+`brew`). Customize in `init.lua`:
+
+```lua
+-- Option 1: choose a known manager (or any name when both hooks are supplied).
+klua.system = {
+    manager = "apt",
+    status_cmd = "dpkg-query -W -f='${Status}' %s 2>/dev/null | grep -qx 'install ok installed'",
+    install_cmd = "apt-get install -y -- %s",
+}
+
+-- Option 2: full hooks. `install` receives the whole missing batch as an array.
+klua.system = {
+    manager = "nix",
+    status = function(pkg)
+        return klua.exec("nix profile list | grep -q " .. pkg) == 0
+    end,
+    install = function(pkgs)
+        return klua.exec("nix profile install nixpkgs#" .. table.concat(pkgs, " nixpkgs#"))
+    end,
+}
+```
+
+`status(pkg)` returns true (or numeric `0`) when installed; `install(pkgs)`
+returns `0`/true on success. Both hooks are optional, but a custom
+`manager` string without a known implementation needs both. Manifest
+`depends:` entries without a scheme, or with a system scheme, use this same
+batch; other targets are dispatched through their normal provider.
+
+## Lockfile
+
+`packages.lock.yaml` is read from `klua.paths.lock` (normally
+`~/.config/klua/packages.lock.yaml`). Keys are canonical scheme targets:
+tags are stripped from `gh:` / `gl:` targets so `gh:user/repo@v1` and
+`gh:user/repo` share one entry. Each entry has `provider`, `version`,
+`asset`, `url` and a lowercase 64-character `sha256`.
+
+`--lock` records these values after a successful resolution; `--locked`
+requires them and skips fresh release discovery. The baseline exposes:
+
+```lua
+klua.lockfile.require()                         -- bool; --locked needs a lockfile
+local entry = klua.lockfile.get(target, provider) -- nil, true on a locked-target error
+klua.lockfile.record(target, provider, version, asset, url, sha256) -- only with --lock
+local code = klua.lockfile.verify(payload, asset, entry, "my:provider")
+klua.lockfile.save()                            -- writes the file only with --lock
+```
+
+Custom providers that want lock support should call `get()` before network
+access, use `entry.url` / `entry.version` when present, call `verify()` after
+download, and call `record()` with the resolved metadata when `--lock` is set.
+The built-in `gh:`, `gl:` and `url:` providers already do this. `--locked` is
+mutually exclusive with `--lock` and `--skip-checksum`; `sys:` and custom
+non-release schemes are not locked.
 
 ## Registry shard cache
 
@@ -209,9 +292,9 @@ of positional strings. Names: `install`, `run`, `search`, `info`, `cleanup`,
 `doctor`, `add`, `remove`, `sync`, `upgrade`, `tap`, `list`, `init-manifest`
 (note the dash: `klua.commands["init-manifest"]`). `run` receives the target
 plus all pass-through arguments. CLI-wide switches (`--no-cache`,
-`--skip-checksum`) are consumed by CLI11 and exposed as `klua.cli_flags`;
-they are not passed in `args`. Return a process exit code. Override or
-wrap freely:
+`--skip-checksum`, `--lock`, `--locked`) are consumed by CLI11 and exposed as
+`klua.cli_flags`; they are not passed in `args`. Return a process exit code.
+Override or wrap freely:
 
 ```lua
 local default_list = klua.commands.list

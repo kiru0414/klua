@@ -85,6 +85,7 @@ void LuaEngine::bind_natives() {
     paths_table["shards"] = paths::shards_dir().string();
     paths_table["init"] = paths::user_init().string();
     paths_table["packages"] = paths::packages_file().string();
+    paths_table["lock"] = paths::lock_file().string();
     paths_table["taps"] = paths::taps_file().string();
     k["paths"] = paths_table;
 
@@ -398,10 +399,12 @@ int LuaEngine::run_command(const std::string& name, const std::vector<std::strin
     return 0;
 }
 
-void LuaEngine::set_cli_flags(bool no_cache, bool skip_checksum) {
+void LuaEngine::set_cli_flags(bool no_cache, bool skip_checksum, bool locked, bool lock) {
     sol::table flags = lua_["klua"]["cli_flags"].get_or_create<sol::table>();
     flags["no_cache"] = no_cache;
     flags["skip_checksum"] = skip_checksum;
+    flags["locked"] = locked;
+    flags["lock"] = lock;
 }
 
 } // namespace klua

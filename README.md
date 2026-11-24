@@ -32,7 +32,11 @@ your `init.lua` can evolve every provider or command without recompiling.
   unless `--force` is given, and supports `--as NAME` to avoid collisions.
 - **Verified downloads.** Matching `.sha256`, `.sha256sum` and `checksums.txt`
   assets are checked before extraction; a mismatch aborts the install unless
-  `--skip-checksum` is explicitly given.
+  `--skip-checksum` is explicitly given. Locked installs also verify the exact
+  SHA-256 recorded in `packages.lock.yaml`.
+- **Reproducible installs.** `sync --lock` records versions, asset URLs and
+  digests; `sync --locked` reproduces them without release discovery and fails
+  on any mismatch.
 - **Self-evolving Lua customization.** The embedded baseline is always the
   fallback; your `init.lua` can override providers, command handlers and
   linking policy at runtime. `klua repair` now backs up custom Lua instead of
@@ -40,8 +44,9 @@ your `init.lua` can evolve every provider or command without recompiling.
 
 ## Status
 
-Milestones 1, 2 and 3 plus the v0.4.0 safety release and the v0.5.0
-resolution/verification release are implemented:
+Milestones 1, 2 and 3 plus the v0.4.0 safety release, the v0.5.0
+resolution/verification release and the v0.6.0 delegation/reproducibility
+release are implemented:
 
 **Milestone 1 — core skeleton**
 
@@ -148,6 +153,25 @@ resolution/verification release are implemented:
   `search`, `info`, `cleanup`, `doctor`, `sync`, `upgrade` and `remove`, and
   are covered by Levenshtein typo hints.
 
+**v0.6.0 — batched system delegation, CI tokens & lockfiles**
+
+- `sys:pkg1,pkg2,...` (and `apt:`, `dnf:`, `yum:`, `pacman:`, `apk:`, `brew:`)
+  checks package status first and installs every missing package in **one**
+  manager command instead of invoking `sudo` per package. `klua.yaml`
+  `depends:` uses the same queue, and already-installed packages are skipped.
+  `klua.system.manager`, `.status()` and `.install()` can override detection.
+- The native HTTP client sends `Authorization: Bearer` to `api.github.com`
+  when `GITHUB_TOKEN`/`GH_TOKEN` is set, and `PRIVATE-TOKEN` plus Bearer to
+  GitLab API endpoints when `GITLAB_TOKEN` is set.
+  `KLUA_GITHUB_API_HOST` / `KLUA_GITLAB_API_HOST` enable the same behavior for
+  trusted self-hosted mirrors; tokens are never sent to raw files or downloads.
+- `packages.lock.yaml` records each resolved target's provider, version, asset
+  URL and SHA-256. `sync --lock` writes it; `sync --locked` requires it,
+  skips web/API release discovery and verifies the recorded digest before
+  extraction. `install --lock` / `install --locked` work the same way.
+- The starter registry now includes `ripgrep`, `fd`, `bat`, `eza`, `fzf`,
+  `zoxide`, `starship`, `neovim`/`nvim`, `gh`, `lazygit` and `glab`.
+
 See `AGENTS.md` for the full roadmap.
 
 ## Testing
@@ -159,6 +183,7 @@ bash tests/test_milestone3.sh   # add/sync/upgrade + local manifest & build test
 bash tests/test_ux.sh           # remove, CLI/alias typo suggestions
 bash tests/test_v04.sh          # offline: conflict safety, run, management, repair
 bash tests/test_v05.sh          # offline: API-free GitHub, shard cache, SHA-256
+bash tests/test_v06.sh          # offline: sys batching, tokens, lockfiles
 ```
 
 ## Building (Linux / macOS)
@@ -190,6 +215,9 @@ klua install --force git      # override shadowing/protected-command guard
 klua install --as jq2 jq      # link the primary binary as ~/.local/bin/jq2
 klua install --no-cache fd    # refetch the registry shard instead of using cache
 klua install --skip-checksum jq  # bypass SHA-256 verification (explicit)
+klua install sys:git,curl     # skip installed packages; batch the rest
+klua sync --lock              # write versions, URLs and digests to the lockfile
+klua sync --locked            # reproduce exactly from packages.lock.yaml
 klua run jq --version         # execute from the store, no global symlink
 klua search jq                # search alias shards across all registries
 klua info jq                  # resolution, versions, links, release metadata
@@ -212,7 +240,7 @@ klua repair --dry-run         # preview backup path and diff, change nothing
 
 | Purpose | Path                                            |
 | ------- | ----------------------------------------------- |
-| Config  | `~/.config/klua/` (`init.lua`, `packages.yaml`, `taps.yaml`) |
+| Config  | `~/.config/klua/` (`init.lua`, `packages.yaml`, `packages.lock.yaml`, `taps.yaml`) |
 | Store   | `~/.local/share/klua/store/<provider>/<user>/<repo>/<version>/` |
 | Bin     | `~/.local/bin/` (symlinks into the store)       |
 | Cache   | `~/.cache/klua/` (`downloads/`, `checksums/`, `build/`, `shards/`) |
@@ -241,8 +269,10 @@ Native primitives available to Lua: `klua.info/warn/error`,
 `klua.sha256`, `klua.extract/is_archive`, `klua.symlink`, `klua.chmod_exec`,
 `klua.json_parse/yaml_parse`, `klua.platform`, `klua.paths`, `klua.version`.
 Set `klua.shard_ttl` to change the one-hour cache lifetime and
-`klua.cli_flags` to inspect `--no-cache` / `--skip-checksum` from your own
-handlers. Set `klua.install_opts =
+`klua.cli_flags` to inspect `--no-cache`, `--skip-checksum`, `--lock` and
+`--locked` from your own handlers. `klua.system` can override system-package
+detection/status/installation, and `klua.lockfile` exposes the parsed lock
+entries. Set `klua.install_opts =
 { force = ..., link = ..., as = ... }` in a custom handler to control conflict
 overrides, rename the primary link, or request a store-only (run-only)
 install. This is the "self-evolving" part: rebind `klua.commands.<name>` or

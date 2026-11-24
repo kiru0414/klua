@@ -68,6 +68,10 @@ fs::path packages_file() {
     return config_dir() / "packages.yaml";
 }
 
+fs::path lock_file() {
+    return config_dir() / "packages.lock.yaml";
+}
+
 fs::path taps_file() {
     return config_dir() / "taps.yaml";
 }

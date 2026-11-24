@@ -87,26 +87,45 @@ std::string github_token() {
     return {};
 }
 
-// Tokens are sent only to GitHub's API by default. A user who points
-// klua.github_api at a trusted mirror can opt in with KLUA_GITHUB_API_HOST
-// (useful for GitHub Enterprise and offline test servers). For a custom host
-// the token is limited to API-looking paths, not raw files or downloads.
-bool token_allowed(const Url& url) {
+bool is_api_path(const std::string& path) {
+    return path.find("/api/") == 0 || path.find("/repos/") != std::string::npos;
+}
+
+// Tokens are sent only to API endpoints by default. A user who points a
+// provider at a trusted mirror can opt in with KLUA_GITHUB_API_HOST or
+// KLUA_GITLAB_API_HOST (GitHub Enterprise, self-hosted GitLab, test servers).
+// The override still limits the token to API-looking paths, never raw files or
+// release downloads.
+bool github_token_allowed(const Url& url) {
     if (url.host == "api.github.com") {
         return true;
     }
     const std::string override = env_or_empty("KLUA_GITHUB_API_HOST");
-    if (override.empty() || url.host != override) {
-        return false;
+    return !override.empty() && url.host == override && is_api_path(url.path);
+}
+
+bool gitlab_token_allowed(const Url& url) {
+    if (url.host == "gitlab.com") {
+        return is_api_path(url.path);
     }
-    return url.path.find("/api/") == 0 || url.path.find("/repos/") != std::string::npos;
+    const std::string override = env_or_empty("KLUA_GITLAB_API_HOST");
+    return !override.empty() && url.host == override && is_api_path(url.path);
 }
 
 httplib::Headers default_headers(const Url& url) {
     httplib::Headers headers{{"User-Agent", std::string{"klua/"} + KLUA_VERSION}};
-    if (token_allowed(url)) {
+    if (github_token_allowed(url)) {
         const std::string token = github_token();
         if (!token.empty()) {
+            headers.emplace("Authorization", "Bearer " + token);
+        }
+    }
+    if (gitlab_token_allowed(url)) {
+        const std::string token = env_or_empty("GITLAB_TOKEN");
+        if (!token.empty()) {
+            // PRIVATE-TOKEN is GitLab's canonical PAT header. Bearer is also
+            // accepted on modern GitLab and keeps custom mirrors simple.
+            headers.emplace("PRIVATE-TOKEN", token);
             headers.emplace("Authorization", "Bearer " + token);
         }
     }

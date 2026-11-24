@@ -39,6 +39,9 @@ jobs:
       - name: v0.5.0 tests (API-free GitHub, shard cache, SHA-256)
         run: bash tests/test_v05.sh
 
+      - name: v0.6.0 tests (system delegation, tokens, lockfiles)
+        run: bash tests/test_v06.sh
+
   build-macos:
     name: Build (macOS arm64)
     runs-on: macos-14
