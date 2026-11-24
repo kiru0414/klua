@@ -293,7 +293,7 @@ void suggest_cli_typos(int argc, char** argv) {
         "init-manifest", "remove", "rm", "uninstall", "run", "search", "info",
         "cleanup", "doctor"};
     const std::vector<std::string> flags = {"--help", "-h", "--version", "--force",
-                                            "--dry-run", "--diff"};
+                                            "--as", "--dry-run", "--diff"};
 
     for (int index = 1; index < argc; ++index) {
         const std::string token = argv[index];
@@ -346,11 +346,14 @@ int main(int argc, char** argv) {
     CommandArgs args;
 
     bool install_force = false;
+    std::string install_as;
     auto* install = app.add_subcommand("install", "Install packages (scheme targets such as gh:user/repo)")
                           ->alias("i");
     install->add_option("targets", args.install_targets, "Targets to install")->required();
     install->add_flag("--force", install_force,
                       "Link even when a command would shadow a system/protected binary");
+    install->add_option("--as", install_as,
+                        "Link the primary binary under this name instead of its own");
 
     auto* add = app.add_subcommand("add", "Record targets in packages.yaml without installing");
     add->add_option("targets", args.add_targets, "Targets to record")->required();
@@ -445,10 +448,16 @@ int main(int argc, char** argv) {
         return engine.run_command("run", run->remaining());
     }
     if (install->parsed()) {
-        std::vector<std::string> install_args = args.install_targets;
+        std::vector<std::string> install_args;
         if (install_force) {
-            install_args.insert(install_args.begin(), "--force");
+            install_args.push_back("--force");
         }
+        if (!install_as.empty()) {
+            install_args.push_back("--as");
+            install_args.push_back(install_as);
+        }
+        install_args.insert(install_args.end(), args.install_targets.begin(),
+                            args.install_targets.end());
         return engine.run_command("install", install_args);
     }
     if (add->parsed()) {

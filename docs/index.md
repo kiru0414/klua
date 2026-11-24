@@ -3,15 +3,36 @@
 A fast, zero-dependency, self-healing package manager built with **C++20** and
 **Lua 5.4** (sol2), targeting **Linux and macOS**.
 
+> **Safer than Homebrew, simpler than Nix, and infinitely hackable in Lua.**
+
 Heavy lifting (HTTP, extraction, filesystem, YAML) lives in native C++20;
 resolution logic, providers and lifecycle hooks are extensible in Lua.
+Packages stay in an isolated per-package store, shared libraries never pollute
+`~/.local/bin`, PATH conflicts are detected before any symlink is created, and
+your `init.lua` can evolve every provider or command without recompiling.
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md) — installation, XDG paths, CLI, self-healing
-- [klua.yaml manifests](docs/klua-yaml.md) — assets, bins, configs, build.steps
-- [Lua API reference](docs/lua-api.md) — native primitives, hooks, recipes
-- [Taps & registry](docs/taps-and-registry.md) — alias sharding, hosting a tap, contributing aliases
+- [Getting started](getting-started.md) — installation, XDG paths, CLI, self-healing
+- [klua.yaml manifests](klua-yaml.md) — assets, bins, configs, build.steps
+- [Lua API reference](lua-api.md) — native primitives, hooks, recipes
+- [Taps & registry](taps-and-registry.md) — alias sharding, hosting a tap, contributing aliases
+
+## Design philosophy
+
+- **Isolated store.** Every version is extracted intact under
+  `~/.local/share/klua/store/<provider>/<user>/<repo>/<version>/`;
+  `~/.local/bin` holds only symlinks to the chosen binaries.
+- **No shared library pollution.** `.so`, `.so.*`, `.dylib`, `.a`, `.la` and
+  `.dll` files are never linked globally. `klua run` exposes them only to the
+  process it launches via `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`.
+- **Automatic PATH conflict protection.** Before linking, klua scans `PATH`,
+  warns about existing commands, refuses to shadow protected core commands
+  unless `--force` is given, and supports `--as NAME` to avoid collisions.
+- **Self-evolving Lua customization.** The embedded baseline is always the
+  fallback; your `init.lua` can override providers, command handlers and
+  linking policy at runtime. `klua repair` now backs up custom Lua instead of
+  silently destroying it.
 
 ## Status
 
@@ -68,8 +89,8 @@ Milestones 1, 2 and 3 plus the v0.4.0 management/safety release are implemented:
 - Official registry default:
   `https://raw.githubusercontent.com/kiru0414/klua-registry/main`
   (githubusercontent.com). Starter shard content lives in
-  `registry-template/v1/` — copy its contents (`v1/`) to the **root** of
-  the `klua-registry` repository (not the `registry-template/` wrapper).
+  `registry-template/v1/` — copy the `v1/` contents to the **root** of the
+  `klua-registry` repository (not the `registry-template/` wrapper).
 - `.github/workflows/release.yml` builds static Linux binaries (x86_64 +
   arm64) and macOS binaries (x86_64 + arm64) on `v*` tags and attaches
   them to the GitHub release.
@@ -79,7 +100,8 @@ Milestones 1, 2 and 3 plus the v0.4.0 management/safety release are implemented:
 - Before linking, klua scans `PATH`, refuses to shadow protected core
   commands (`git`, `curl`, `python`, `python3`, `apt`, `sudo`, `klua`, …) and
   warns about existing binaries. The package still installs into the store;
-  `klua install --force` explicitly overrides either guard.
+  `klua install --force` explicitly overrides either guard, and
+  `klua install --as NAME` chooses the command name for the primary binary.
 - Shared/static libraries (`.so`, `.so.*`, `.dylib`, `.a`, `.la`, `.dll`) are
   never linked into `~/.local/bin/` — they remain isolated inside the store.
 - `klua run <target> [args...]` stages a missing package in the store without
@@ -90,10 +112,13 @@ Milestones 1, 2 and 3 plus the v0.4.0 management/safety release are implemented:
   links and release metadata; `klua cleanup` prunes old versions, broken or
   library links and caches; `klua doctor` checks dirs, PATH, registries and
   links.
-- Levenshtein typo hints cover subcommands, flags and registry aliases,
-  including all of the new commands.
-- `klua repair` is non-destructive by default: it backs up custom Lua before
-  restoring the baseline, and `--dry-run` / `--diff` shows the pending change.
+- Levenshtein typo hints cover subcommands (`install`, `run`, `search`,
+  `info`, `cleanup`, `doctor`, `remove`/`rm`/`uninstall`, …), flags
+  (`--force`, `--as`, `--dry-run`, …) and registry aliases — a mistyped
+  `klua serach jq` suggests `search`.
+- `klua repair` is non-destructive by default: it backs up custom Lua to
+  `init.lua.bak.<timestamp>` and prints the path; `--dry-run` / `--diff`
+  shows the backup path and a unified diff without changing any files.
 
 See `AGENTS.md` for the full roadmap.
 
@@ -133,6 +158,7 @@ klua install fd               # alias sharding -> v1/f.yaml -> gh:sharkdp/fd
 klua install gh:jqlang/jq     # direct GitHub Releases install
 klua i gh:jqlang/jq@jq-1.7.1  # pinned tag
 klua install --force git      # override shadowing/protected-command guard
+klua install --as jq2 jq      # link the primary binary as ~/.local/bin/jq2
 klua run jq --version         # execute from the store, no global symlink
 klua search jq                # search alias shards across all registries
 klua info jq                  # resolution, versions, links, release metadata
@@ -143,6 +169,8 @@ klua sync                     # install everything in packages.yaml
 klua sync https://host/dotfiles.yaml  # remote source, follows includes:
 klua upgrade                  # upgrade all installed packages
 klua remove fd                # delete symlinks, store dir, packages.yaml entry
+klua rm gh:jqlang/jq          # alias of remove
+klua uninstall url:https://host/tool.tar.gz  # alias of remove
 klua list                     # installed packages from the store
 klua init-manifest            # starter klua.yaml for a package repo
 klua repair                   # back up and restore a clean init.lua
@@ -181,5 +209,7 @@ Native primitives available to Lua: `klua.info/warn/error`,
 `klua.register_provider`, `klua.http_get/download`, `klua.extract/is_archive`,
 `klua.symlink`, `klua.chmod_exec`, `klua.json_parse/yaml_parse`,
 `klua.platform`, `klua.paths`, `klua.version`. Set `klua.install_opts =
-{ force = ..., link = ... }` in a custom handler to control conflict
-overrides or request a store-only (run-only) install.
+{ force = ..., link = ..., as = ... }` in a custom handler to control conflict
+overrides, rename the primary link, or request a store-only (run-only)
+install. This is the "self-evolving" part: rebind `klua.commands.<name>` or
+register a provider in `init.lua` and the CLI immediately behaves differently.

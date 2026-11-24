@@ -4,6 +4,13 @@ klua is a self-healing package manager: a C++20 core does the heavy lifting
 (HTTP, extraction, filesystem, YAML/JSON parsing), Lua 5.4 does the thinking
 (providers, resolution, lifecycle hooks). Linux and macOS only.
 
+> **Safer than Homebrew, simpler than Nix, and infinitely hackable in Lua.**
+
+That means an isolated store per package version, no shared library pollution
+in `~/.local/bin`, automatic PATH conflict protection before every symlink,
+and a Lua `init.lua` you can evolve at any time — with `klua repair` backing up
+your custom code before restoring the embedded baseline.
+
 ## Installation
 
 ### From GitHub Releases
@@ -63,10 +70,22 @@ Overrides are honored only when absolute. Archives are extracted intact
 into the store (single top-level wrapper directories are stripped), so
 relative layouts of complex tools survive.
 
+## Design philosophy
+
+- **Isolated store:** binaries and libraries live under
+  `~/.local/share/klua/store/...`; `~/.local/bin` contains only symlinks.
+- **No shared library pollution:** library-looking files are never linked
+  globally; `klua run` exposes store libraries only to the launched process.
+- **Automatic PATH conflict protection:** klua scans `PATH`, skips/warns on
+  collisions, protects core commands, and offers `--force` / `--as` instead of
+  silently overwriting your system.
+- **Self-evolving Lua customization:** `init.lua` can replace providers and
+  command handlers; the embedded baseline is always the safe fallback.
+
 ## CLI
 
 ```
-klua install [--force] <target>...   (alias: klua i)
+klua install [--force] [--as NAME] <target>...   (alias: klua i)
 klua run <target> [--] [args...]     # store-only execution, no symlink
 klua search <query>
 klua info <target>
@@ -83,7 +102,10 @@ klua init-manifest [--force]
 klua --version | --help
 ```
 
-Mistyped subcommands, flags, and aliases get a Levenshtein-based hint:
+Mistyped subcommands, flags, and aliases get a Levenshtein-based hint. The
+suggestion dictionary includes `install`, `run`, `search`, `info`, `cleanup`,
+`doctor`, `remove`/`rm`/`uninstall`, and flags such as `--force`, `--as`,
+`--dry-run` and `--diff`:
 
 ```
 $ klua instll
@@ -128,12 +150,19 @@ Before creating any link, klua scans `PATH` and:
 
 A skipped link is not an install failure: the package remains staged in the
 store. Existing links that point into the store are replaced normally, so
-upgrades keep working. Pass `--force` to consciously override either guard:
+upgrades keep working. Pass `--force` to consciously override either guard, or
+`--as NAME` to install under a non-conflicting command name:
 
 ```sh
-klua install git            # warns and leaves ~/.local/bin/git alone
-klua install --force git    # creates the link anyway
+klua install git                # warns and leaves ~/.local/bin/git alone
+klua install --force git        # creates the link anyway
+klua install --as jq2 jq        # links ~/.local/bin/jq2 instead of ~/.local/bin/jq
 ```
+
+`--as` renames only the primary binary; additional binaries from the same
+package keep their own names. It requires a single target, rejects path
+separators and `.`/`..`, and still goes through all conflict checks using the
+chosen name.
 
 ### run
 

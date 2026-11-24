@@ -220,6 +220,23 @@ run run runner again
 check "run on installed package exits 0" 0 $?
 expect_absent "no reinstall on second run" "installing 'runner'"
 
+# --- install --as (custom command name) -------------------------------------------
+run install --as alt-runner runner
+check "install --as exits 0" 0 $?
+expect_output "--as reports renamed link" "linked $HOME/.local/bin/alt-runner"
+[ -L "$HOME/.local/bin/alt-runner" ]
+exists "--as created renamed link" $?
+[ ! -L "$HOME/.local/bin/runner" ]
+exists "--as did not create the original name" $?
+
+run install --as ../escape runner
+check "invalid --as exits 1" 1 $?
+expect_output "invalid --as rejected" "invalid --as name"
+
+run install --as multi tool runner
+check "--as with multiple targets exits 1" 1 $?
+expect_output "multiple targets explained" "--as can only be used with a single target"
+
 # --- search ---------------------------------------------------------------------
 run search zip
 check "search exits 0" 0 $?
