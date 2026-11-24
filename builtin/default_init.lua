@@ -521,6 +521,12 @@ local function shard_char(target)
     return "_"
 end
 
+local function shard_entries(doc)
+    if type(doc) ~= "table" then return {} end
+    if type(doc.aliases) == "table" then return doc.aliases end
+    return doc
+end
+
 local function resolve_alias(target)
     local registries = all_registries()
     if #registries == 0 then
@@ -536,13 +542,19 @@ local function resolve_alias(target)
         if body then
             local doc, parse_err = klua.yaml_parse(body)
             if doc and type(doc) == "table" then
-                for key in pairs(doc) do
+                local entries = shard_entries(doc)
+                for key in pairs(entries) do
                     if type(key) == "string" and not seen[key] then
                         seen[key] = true
                         candidates[#candidates + 1] = key
                     end
                 end
-                local resolved = doc[target]
+                local resolved = entries[target]
+                local depth = 0
+                while type(resolved) == "string" and resolved ~= "" and not string.find(resolved, ":", 1, true) and depth < 5 do
+                    resolved = entries[resolved]
+                    depth = depth + 1
+                end
                 if type(resolved) == "string" and resolved ~= "" then
                     return resolved
                 end
