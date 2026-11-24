@@ -8,14 +8,20 @@
 -- Native primitives provided by the C++ core (see src/lua_engine.cpp):
 --   klua.version, klua.paths, klua.platform(), klua.cwd()
 --   klua.info / klua.warn / klua.error
---   klua.file_exists / klua.read_file / klua.write_file / klua.mkdir
+--   klua.file_exists / klua.is_dir / klua.is_executable
+--   klua.read_file / klua.write_file / klua.mkdir
 --   klua.copy / klua.remove / klua.list_dir / klua.find_executables
---   klua.env / klua.exec / klua.register_provider
+--   klua.readlink / klua.env / klua.exec / klua.register_provider
 --   klua.http_get / klua.download / klua.extract / klua.is_archive
 --   klua.symlink / klua.chmod_exec / klua.json_parse / klua.yaml_parse
 
 klua.providers = klua.providers or {}
 klua.commands = klua.commands or {}
+
+-- Install-time options, consumed by the safe linking helpers below.
+--   force: link even when the name conflicts with a system/protected command
+--   link:  false to stage a package in the store without touching ~/.local/bin
+klua.install_opts = klua.install_opts or {}
 
 -- Official registry (hosted on githubusercontent.com via the klua-registry
 -- repository). Users can extend this list in their init.lua; `klua tap add
@@ -108,6 +114,154 @@ local function expand_home(path)
         return home .. string.sub(path, 2)
     end
     return path
+end
+
+-- ---------------------------------------------------------------------------
+-- Conflict-safe linking
+--
+-- klua never blindly replaces binaries. Before creating a link it checks:
+--   1. whether the destination already holds something klua does not manage,
+--   2. whether the command shadows a binary elsewhere on PATH,
+--   3. whether the name is a protected core system command.
+-- Conflicting links are skipped with a warning; --force overrides. Shared
+-- libraries are never linked: they stay inside the store and klua run
+-- exposes them through LD_LIBRARY_PATH / DYLD_LIBRARY_PATH only.
+-- ---------------------------------------------------------------------------
+
+local CORE_COMMANDS = {
+    -- shells and coreutils
+    sh = true, bash = true, zsh = true, fish = true, dash = true, ksh = true,
+    ls = true, cp = true, mv = true, rm = true, ln = true, mkdir = true,
+    rmdir = true, cat = true, echo = true, grep = true, sed = true, awk = true,
+    find = true, xargs = true, tar = true, gzip = true, gunzip = true,
+    bzip2 = true, xz = true, zstd = true, unzip = true, mount = true,
+    umount = true, kill = true, ps = true, chmod = true, chown = true,
+    -- network and transport
+    git = true, curl = true, wget = true, ssh = true, scp = true,
+    rsync = true, openssl = true,
+    -- language runtimes and package managers
+    python = true, ["python3"] = true, pip = true, ["pip3"] = true,
+    node = true, npm = true, npx = true, perl = true, ruby = true,
+    php = true, java = true, javac = true,
+    -- build toolchains
+    make = true, cmake = true, cc = true, gcc = true, ["g++"] = true,
+    clang = true, ["clang++"] = true, ld = true, ["pkg-config"] = true,
+    -- system / package managers
+    sudo = true, su = true, systemctl = true, pacman = true, apt = true,
+    ["apt-get"] = true, dnf = true, yum = true, apk = true, brew = true,
+    port = true, docker = true, podman = true, kubectl = true,
+    -- editors and pagers
+    vim = true, vi = true, nano = true, emacs = true, man = true,
+    less = true, more = true,
+    -- never let a package shadow klua itself
+    klua = true,
+}
+
+-- Shared/static library names must never be linked into ~/.local/bin.
+local function is_library_name(name)
+    local lower = string.lower(name)
+    if string.sub(lower, -3) == ".so" or string.find(lower, "%.so%.", 1, false) then
+        return true
+    end
+    return string.sub(lower, -6) == ".dylib"
+        or string.sub(lower, -2) == ".a"
+        or string.sub(lower, -3) == ".la"
+        or string.sub(lower, -4) == ".dll"
+end
+
+local function normalize_dir(dir)
+    if #dir > 1 then
+        return (string.gsub(dir, "/+$", ""))
+    end
+    return dir
+end
+
+local function path_dirs()
+    local dirs, seen = {}, {}
+    for dir in string.gmatch(klua.env("PATH") or "", "[^:]+") do
+        dir = normalize_dir(dir)
+        if dir ~= "" and not seen[dir] then
+            seen[dir] = true
+            dirs[#dirs + 1] = dir
+        end
+    end
+    return dirs
+end
+
+local function is_under_store(path)
+    local store = normalize_dir(klua.paths.store)
+    return path == store or string.sub(path, 1, #store + 1) == store .. "/"
+end
+
+-- First executable named `name` on PATH, ignoring klua's own bin directory
+-- and links that already point into the store.
+local function find_on_path(name)
+    local own_bin = normalize_dir(klua.paths.bin)
+    for _, dir in ipairs(path_dirs()) do
+        if dir ~= own_bin then
+            local candidate = dir .. "/" .. name
+            if klua.is_executable(candidate) then
+                local link_target = klua.readlink(candidate)
+                if not (link_target and is_under_store(link_target)) then
+                    return candidate
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Create a link into ~/.local/bin after conflict checks. Returns false only
+-- for real filesystem errors; a deliberately skipped conflict is success.
+local function safe_link(target_path, link_path, name)
+    local opts = klua.install_opts or {}
+    name = name or basename(link_path)
+
+    if opts.link == false then
+        return true -- run-only staging: keep the store isolated
+    end
+
+    if is_library_name(name) then
+        klua.warn("skipping shared library '" .. name
+            .. "'; libraries stay isolated inside the store")
+        return true
+    end
+
+    local existing = klua.readlink(link_path)
+    local managed = existing ~= nil and is_under_store(existing)
+    local occupied = existing ~= nil or klua.file_exists(link_path)
+    if occupied and not managed and not opts.force then
+        klua.warn(link_path .. " already exists and is not managed by klua; "
+            .. "not linking '" .. name .. "' (use --force to replace)")
+        return true
+    end
+
+    local system_path = not managed and find_on_path(name) or nil
+
+    if CORE_COMMANDS[name] and not managed then
+        if not opts.force then
+            klua.warn("refusing to link protected command '" .. name .. "'"
+                .. (system_path and (" (system binary: " .. system_path .. ")") or "")
+                .. "; use --force to override")
+            return true
+        end
+        klua.warn("overriding protected command '" .. name .. "'")
+    elseif system_path then
+        if not opts.force then
+            klua.warn("'" .. name .. "' already exists on PATH at " .. system_path
+                .. "; not linking (use --force to shadow)")
+            return true
+        end
+        klua.warn("shadowing existing '" .. name .. "' at " .. system_path)
+    end
+
+    local ok, err = klua.symlink(target_path, link_path)
+    if not ok then
+        klua.error(tostring(err))
+        return false
+    end
+    klua.info("linked " .. link_path)
+    return true
 end
 
 -- Translate a simple glob (* and ?) into an anchored Lua pattern.
@@ -369,6 +523,9 @@ end
 
 -- Link binaries listed in manifest.bins, or auto-detect one executable.
 local function link_binaries(store_dir, manifest, preferred_name)
+    if (klua.install_opts or {}).link == false then
+        return 0 -- run-only staging
+    end
     if manifest and type(manifest.bins) == "table" and #manifest.bins > 0 then
         for _, bin in ipairs(manifest.bins) do
             local path = store_dir .. "/" .. bin
@@ -381,17 +538,27 @@ local function link_binaries(store_dir, manifest, preferred_name)
                 klua.error(tostring(err))
                 return 1
             end
-            ok, err = klua.symlink(path, klua.paths.bin .. "/" .. basename(bin))
-            if not ok then
-                klua.error(tostring(err))
+            local link_name = basename(bin)
+            if is_library_name(link_name) then
+                klua.warn("manifest bin '" .. bin
+                    .. "' is a shared library; leaving it inside the store")
+            elseif not safe_link(path, klua.paths.bin .. "/" .. link_name, link_name) then
                 return 1
             end
-            klua.info("linked " .. klua.paths.bin .. "/" .. basename(bin))
         end
         return 0
     end
 
-    local candidates = klua.find_executables(store_dir)
+    local raw = klua.find_executables(store_dir)
+    local candidates = {}
+    for _, path in ipairs(raw) do
+        local name = basename(path)
+        if is_library_name(name) then
+            klua.warn("ignoring shared library '" .. name .. "' (left in the store)")
+        else
+            candidates[#candidates + 1] = path
+        end
+    end
     if #candidates == 0 then
         klua.error("no executable binary found in " .. store_dir)
         return 1
@@ -402,12 +569,9 @@ local function link_binaries(store_dir, manifest, preferred_name)
         klua.error(tostring(err))
         return 1
     end
-    ok, err = klua.symlink(binary, klua.paths.bin .. "/" .. basename(binary))
-    if not ok then
-        klua.error(tostring(err))
+    if not safe_link(binary, klua.paths.bin .. "/" .. basename(binary)) then
         return 1
     end
-    klua.info("linked " .. klua.paths.bin .. "/" .. basename(binary))
     return 0
 end
 
@@ -474,15 +638,14 @@ local function install_payload(payload_path, asset_name, store_dir, preferred_na
     local has_manifest_bins = manifest and type(manifest.bins) == "table" and #manifest.bins > 0
     if not has_manifest_bins and not klua.is_archive(asset_name) then
         ok, err = klua.chmod_exec(store_dir .. "/" .. asset_name)
-        if ok then
-            ok, err = klua.symlink(store_dir .. "/" .. asset_name,
-                                   klua.paths.bin .. "/" .. preferred_name)
-        end
         if not ok then
             klua.error(tostring(err))
             return 1
         end
-        klua.info("linked " .. klua.paths.bin .. "/" .. preferred_name)
+        if not safe_link(store_dir .. "/" .. asset_name,
+                         klua.paths.bin .. "/" .. preferred_name, preferred_name) then
+            return 1
+        end
     else
         local code = link_binaries(store_dir, manifest, preferred_name)
         if code ~= 0 then
@@ -582,12 +745,9 @@ local function build_from_source(clone_base, user, name, tag, manifest, store_di
             klua.error(tostring(err))
             return 1
         end
-        ok, err = klua.symlink(dest, klua.paths.bin .. "/" .. basename(binary))
-        if not ok then
-            klua.error(tostring(err))
+        if not safe_link(dest, klua.paths.bin .. "/" .. basename(binary)) then
             return 1
         end
-        klua.info("linked " .. klua.paths.bin .. "/" .. basename(binary))
     end
 
     local code = apply_configs(store_dir, manifest)
@@ -864,13 +1024,49 @@ local function installed_packages()
     return result
 end
 
+-- Natural (digit-aware) version comparison: 1.10.0 sorts after 1.9.0.
+local function natural_version_less(a, b)
+    local i, j = 1, 1
+    while i <= #a and j <= #b do
+        local da, db = string.match(a, "^%d+", i), string.match(b, "^%d+", j)
+        if da and db then
+            local va, vb = tonumber(da), tonumber(db)
+            if va ~= vb then
+                return va < vb
+            end
+            i, j = i + #da, j + #db
+        else
+            local ca, cb = string.sub(a, i, i), string.sub(b, j, j)
+            if ca ~= cb then
+                return ca < cb
+            end
+            i, j = i + 1, j + 1
+        end
+    end
+    return (#a - i) < (#b - j)
+end
+
+local function sorted_versions(entries)
+    local copy = {}
+    for _, entry in ipairs(entries) do
+        if entry.is_dir then
+            copy[#copy + 1] = entry
+        end
+    end
+    table.sort(copy, function(a, b)
+        return natural_version_less(a.name, b.name)
+    end)
+    return copy
+end
+
 -- Latest stored version for a scheme target (nil when not installed).
 local function current_version(target)
     local scheme, user, repo = string.match(target, "^([%w][%w+_-]*):([^/@]+)/([^/@]+)")
     if not scheme then
         return nil
     end
-    local versions = klua.list_dir(klua.paths.store .. "/" .. scheme .. "/" .. user .. "/" .. repo)
+    local versions = sorted_versions(
+        klua.list_dir(klua.paths.store .. "/" .. scheme .. "/" .. user .. "/" .. repo))
     if #versions == 0 then
         return nil
     end
@@ -929,17 +1125,30 @@ end
 -- ---------------------------------------------------------------------------
 
 function klua.commands.install(args)
-    if #args == 0 then
-        klua.error("usage: klua install <target> [<target>...]")
+    local force = false
+    local targets = {}
+    for _, arg in ipairs(args) do
+        if arg == "--force" then
+            force = true
+        else
+            targets[#targets + 1] = arg
+        end
+    end
+    if #targets == 0 then
+        klua.error("usage: klua install [--force] <target> [<target>...]")
         return 1
     end
+
+    local saved = klua.install_opts
+    klua.install_opts = { force = force, link = true }
     local status = 0
-    for _, target in ipairs(args) do
+    for _, target in ipairs(targets) do
         local code = install_one(target)
         if code ~= 0 then
             status = code
         end
     end
+    klua.install_opts = saved
     return status
 end
 
@@ -1070,6 +1279,574 @@ function klua.commands.remove(args)
         return 1
     end
     return status
+end
+
+-- ---------------------------------------------------------------------------
+-- Shared helpers for run / info / cleanup / doctor
+-- ---------------------------------------------------------------------------
+
+-- Symlinks in ~/.local/bin that point into a package's store path.
+local function linked_binaries(store_base)
+    local base = normalize_dir(store_base)
+    local links = {}
+    for _, entry in ipairs(klua.list_dir(klua.paths.bin)) do
+        if not entry.is_dir then
+            local target = klua.readlink(entry.path)
+            if target and (target == base or string.sub(target, 1, #base + 1) == base .. "/") then
+                links[#links + 1] = entry.name
+            end
+        end
+    end
+    return links
+end
+
+-- Full store directory of the newest installed version (nil when missing).
+-- For `url:` packages the store path already ends in `/direct`.
+local function package_dir_for(scheme, rest)
+    local base = store_path_for(scheme, rest)
+    if not base then
+        return nil
+    end
+    if scheme == "url" then
+        return klua.is_dir(base) and base or nil
+    end
+    local versions = sorted_versions(klua.list_dir(base))
+    if #versions == 0 then
+        return nil
+    end
+    return versions[#versions].path
+end
+
+-- Resolve an alias or a scheme target into (scheme, rest, resolved_target).
+local function resolve_target(arg)
+    local scheme, rest = string.match(arg, "^([%w][%w+_-]*):(.+)$")
+    if scheme then
+        return scheme, rest, arg
+    end
+    local resolved, err, candidates = resolve_alias(arg)
+    if not resolved then
+        local suggestion = closest_match(arg, candidates or {})
+        if suggestion then
+            klua.warn("did you mean '" .. suggestion .. "'?")
+        end
+        return nil, nil, nil, err
+    end
+    scheme, rest = string.match(resolved, "^([%w][%w+_-]*):(.+)$")
+    return scheme, rest, resolved
+end
+
+-- Execute a store binary with the store's libraries isolated to this process
+-- (never linked into system paths).
+local function execute_from_store(binary, store_dir, extra_args)
+    local dirs, seen = {}, {}
+    local function add_dir(dir)
+        if dir and dir ~= "" and not seen[dir] and klua.is_dir(dir) then
+            seen[dir] = true
+            dirs[#dirs + 1] = dir
+        end
+    end
+
+    add_dir(dirname(binary))
+    add_dir(store_dir .. "/bin")
+    add_dir(store_dir .. "/sbin")
+
+    -- Collect lib/lib64/lib32 directories up to two levels deep.
+    local lib_dirs, seen_lib = {}, {}
+    local function add_lib(dir)
+        if klua.is_dir(dir) and not seen_lib[dir] then
+            seen_lib[dir] = true
+            lib_dirs[#lib_dirs + 1] = dir
+        end
+    end
+    add_lib(store_dir)
+    add_lib(store_dir .. "/lib")
+    add_lib(store_dir .. "/lib64")
+    add_lib(store_dir .. "/lib32")
+    local function scan_libs(root, depth)
+        if depth > 2 then
+            return
+        end
+        for _, entry in ipairs(klua.list_dir(root)) do
+            if entry.is_dir then
+                local name = entry.name
+                if name == "lib" or name == "lib64" or name == "lib32" then
+                    add_lib(entry.path)
+                end
+                if name ~= "lib" and name ~= "lib64" and name ~= "lib32" then
+                    scan_libs(entry.path, depth + 1)
+                end
+            end
+        end
+    end
+    scan_libs(store_dir, 0)
+
+    local lib_path = table.concat(lib_dirs, ":")
+    local existing_lib = klua.env("LD_LIBRARY_PATH")
+    if existing_lib and existing_lib ~= "" then
+        lib_path = lib_path .. ":" .. existing_lib
+    end
+
+    local path_entries = { dirname(binary), store_dir .. "/bin", store_dir .. "/sbin" }
+    local path_value = table.concat(path_entries, ":")
+    local existing_path = klua.env("PATH")
+    if existing_path and existing_path ~= "" then
+        path_value = path_value .. ":" .. existing_path
+    end
+
+    local env_parts = {}
+    if klua.platform().os == "macos" then
+        local existing_dyld = klua.env("DYLD_LIBRARY_PATH")
+        if existing_dyld and existing_dyld ~= "" then
+            lib_path = lib_path .. ":" .. existing_dyld
+        end
+        env_parts[#env_parts + 1] = "DYLD_LIBRARY_PATH=" .. shq(lib_path)
+    else
+        env_parts[#env_parts + 1] = "LD_LIBRARY_PATH=" .. shq(lib_path)
+    end
+    env_parts[#env_parts + 1] = "PATH=" .. shq(path_value)
+
+    local parts = { "env" }
+    for _, assignment in ipairs(env_parts) do
+        parts[#parts + 1] = assignment
+    end
+    parts[#parts + 1] = shq(binary)
+    for _, arg in ipairs(extra_args or {}) do
+        parts[#parts + 1] = shq(arg)
+    end
+    return klua.exec(table.concat(parts, " "))
+end
+
+-- ---------------------------------------------------------------------------
+-- klua run <target> [args...]
+-- ---------------------------------------------------------------------------
+
+function klua.commands.run(args)
+    if #args == 0 then
+        klua.error("usage: klua run <target> [--] [args...]")
+        return 1
+    end
+
+    local target = args[1]
+    local extra = {}
+    for index = 2, #args do
+        extra[#extra + 1] = args[index]
+    end
+
+    local scheme, rest, resolved, err = resolve_target(target)
+    if not scheme then
+        klua.error(err)
+        return 1
+    end
+
+    local dir = package_dir_for(scheme, rest)
+    if not dir then
+        klua.info("installing '" .. target .. "' for this run (store only, no links)")
+        local saved = klua.install_opts
+        klua.install_opts = { force = false, link = false }
+        local code = install_one(resolved)
+        klua.install_opts = saved
+        if code ~= 0 then
+            return code
+        end
+        dir = package_dir_for(scheme, rest)
+    end
+    if not dir then
+        klua.error("could not locate installed package for '" .. target .. "'")
+        return 1
+    end
+
+    local candidates = {}
+    for _, path in ipairs(klua.find_executables(dir)) do
+        local name = basename(path)
+        if not is_library_name(name) then
+            klua.chmod_exec(path)
+            candidates[#candidates + 1] = path
+        end
+    end
+    if #candidates == 0 then
+        klua.error("no runnable binary found in " .. dir)
+        return 1
+    end
+
+    local preferred = nil
+    if scheme == "gh" or scheme == "gl" then
+        preferred = string.match(rest, "^[^@]+/([^@/]+)")
+    end
+    local binary = pick_binary(candidates, preferred)
+    return execute_from_store(binary, dir, extra)
+end
+
+-- ---------------------------------------------------------------------------
+-- klua search <query>
+-- ---------------------------------------------------------------------------
+
+local SEARCH_SHARDS = { "_" }
+for character in string.gmatch("abcdefghijklmnopqrstuvwxyz", ".") do
+    SEARCH_SHARDS[#SEARCH_SHARDS + 1] = character
+end
+
+function klua.commands.search(args)
+    local query = args[1]
+    if not query or query == "" then
+        klua.error("usage: klua search <query>")
+        return 1
+    end
+
+    local registries = all_registries()
+    if #registries == 0 then
+        klua.error("no registries configured; add one with 'klua tap add <url>'")
+        return 1
+    end
+
+    local needle = string.lower(query)
+    local aliases, order = {}, {}
+    local reachable = 0
+    for _, base in ipairs(registries) do
+        local base_reachable = false
+        for _, shard in ipairs(SEARCH_SHARDS) do
+            local url = strip_trailing_slash(base) .. "/v1/" .. shard .. ".yaml"
+            local body, status, err = klua.http_get(url)
+            if not err and status == 200 then
+                base_reachable = true
+                local doc, parse_err = klua.yaml_parse(body)
+                if doc and type(doc) == "table" then
+                    for alias, target in pairs(doc) do
+                        if type(alias) == "string" and type(target) == "string"
+                            and aliases[alias] == nil then
+                            aliases[alias] = target
+                            order[#order + 1] = alias
+                        end
+                    end
+                elseif parse_err then
+                    klua.warn("registry " .. base .. " returned invalid YAML: " .. parse_err)
+                end
+            end
+        end
+        if base_reachable then
+            reachable = reachable + 1
+        end
+    end
+
+    if reachable == 0 then
+        klua.error("could not fetch any registry shards; check your network or taps")
+        return 1
+    end
+
+    table.sort(order)
+    local matches = 0
+    for _, alias in ipairs(order) do
+        local target = aliases[alias]
+        if string.find(string.lower(alias), needle, 1, true)
+            or string.find(string.lower(target), needle, 1, true) then
+            matches = matches + 1
+            local padding = string.rep(" ", math.max(1, 20 - #alias))
+            klua.info(alias .. padding .. target)
+        end
+    end
+    if matches == 0 then
+        klua.info("no packages matched '" .. query .. "'")
+    end
+    return 0
+end
+
+-- ---------------------------------------------------------------------------
+-- klua info <target>
+-- ---------------------------------------------------------------------------
+
+function klua.commands.info(args)
+    local target = args[1]
+    if not target or target == "" then
+        klua.error("usage: klua info <target>")
+        return 1
+    end
+
+    local scheme, rest, resolved, err = resolve_target(target)
+    if not scheme then
+        klua.error(err)
+        return 1
+    end
+
+    klua.info("package:  " .. (resolved ~= target and target or resolved))
+    if resolved ~= target then
+        klua.info("target:   " .. resolved)
+    end
+    klua.info("provider: " .. scheme)
+
+    local base = store_path_for(scheme, rest)
+    if not base then
+        klua.error("unsupported target: " .. resolved)
+        return 1
+    end
+
+    local versions = {}
+    if scheme == "url" then
+        if klua.is_dir(base) then
+            versions[1] = "direct"
+        end
+    else
+        for _, entry in ipairs(sorted_versions(klua.list_dir(base))) do
+            versions[#versions + 1] = entry.name
+        end
+    end
+    klua.info("installed: " .. (#versions > 0 and table.concat(versions, ", ") or "no"))
+    klua.info("store:    " .. base .. (scheme == "url" and "" or "/<version>"))
+
+    local links = linked_binaries(base)
+    klua.info("linked:   " .. (#links > 0 and table.concat(links, ", ") or "none"))
+
+    if scheme == "gh" or scheme == "gl" then
+        local user, name = string.match(rest, "^([^/@]+)/([^@/]+)")
+        local tag = string.match(rest, "@(.+)$")
+        if user then
+            local api
+            if scheme == "gh" then
+                api = klua.github_api .. "/repos/" .. user .. "/" .. name
+                    .. "/releases/" .. (tag and ("tags/" .. tag) or "latest")
+            else
+                api = klua.gitlab_api .. "/projects/" .. user .. "%2F" .. name .. "/"
+                    .. (tag and ("releases/" .. tag) or "releases/permalink/latest")
+            end
+            local body, status, request_err = klua.http_get(api)
+            if request_err then
+                klua.warn("could not query release metadata: " .. request_err)
+            elseif status == 200 then
+                local doc = klua.json_parse(body)
+                if type(doc) == "table" then
+                    klua.info("release:  " .. tostring(doc.tag_name or doc.name or "unknown"))
+                    local assets = 0
+                    if scheme == "gh" and type(doc.assets) == "table" then
+                        assets = #doc.assets
+                    elseif scheme == "gl" and type(doc.assets) == "table"
+                        and type(doc.assets.links) == "table" then
+                        assets = #doc.assets.links
+                    end
+                    klua.info("assets:   " .. assets)
+                end
+            elseif status == 404 then
+                klua.info("release:  none")
+            else
+                klua.warn("release query returned HTTP " .. tostring(status))
+            end
+        end
+    elseif scheme == "url" then
+        klua.info("url:      " .. rest)
+    end
+    return 0
+end
+
+-- ---------------------------------------------------------------------------
+-- klua cleanup
+-- ---------------------------------------------------------------------------
+
+function klua.commands.cleanup(args)
+    local removed_versions, broken_links, library_links, cache_removed = 0, 0, 0, 0
+    local status = 0
+
+    for _, provider in ipairs(klua.list_dir(klua.paths.store)) do
+        if provider.is_dir then
+            for _, user in ipairs(klua.list_dir(provider.path)) do
+                if user.is_dir then
+                    for _, repo in ipairs(klua.list_dir(user.path)) do
+                        if repo.is_dir then
+                            local versions = sorted_versions(klua.list_dir(repo.path))
+                            for index = 1, #versions - 1 do
+                                local ok, err = klua.remove(versions[index].path)
+                                if ok then
+                                    removed_versions = removed_versions + 1
+                                    klua.info("removed old version " .. versions[index].path)
+                                else
+                                    klua.error("could not remove " .. versions[index].path
+                                        .. ": " .. tostring(err))
+                                    status = 1
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    for _, entry in ipairs(klua.list_dir(klua.paths.bin)) do
+        if not entry.is_dir then
+            local target = klua.readlink(entry.path)
+            if target then
+                if is_library_name(entry.name) then
+                    local ok = klua.remove(entry.path)
+                    if ok then
+                        library_links = library_links + 1
+                        klua.info("removed library link " .. entry.path)
+                    else
+                        status = 1
+                    end
+                elseif is_under_store(target) and not klua.file_exists(target) then
+                    local ok = klua.remove(entry.path)
+                    if ok then
+                        broken_links = broken_links + 1
+                        klua.info("removed broken link " .. entry.path)
+                    else
+                        status = 1
+                    end
+                end
+            end
+        end
+    end
+
+    for _, subdir in ipairs({ "downloads", "build" }) do
+        local path = klua.paths.cache .. "/" .. subdir
+        if klua.is_dir(path) then
+            local ok = klua.remove(path)
+            if ok then
+                cache_removed = cache_removed + 1
+            else
+                status = 1
+            end
+        end
+    end
+
+    klua.info("cleanup: " .. removed_versions .. " old version(s), "
+        .. broken_links .. " broken link(s), " .. library_links
+        .. " library link(s), " .. cache_removed .. " cache dir(s) removed")
+    return status
+end
+
+-- ---------------------------------------------------------------------------
+-- klua doctor
+-- ---------------------------------------------------------------------------
+
+local function dir_writable(dir)
+    local probe = dir .. "/.klua-doctor-probe"
+    if not klua.write_file(probe, "ok") then
+        return false
+    end
+    klua.remove(probe)
+    return true
+end
+
+function klua.commands.doctor(args)
+    local problems, warnings = 0, 0
+    local function good(message)
+        klua.info("[ok]   " .. message)
+    end
+    local function warning(message)
+        warnings = warnings + 1
+        klua.info("[warn] " .. message)
+    end
+    local function bad(message)
+        problems = problems + 1
+        klua.info("[fail] " .. message)
+    end
+
+    local platform = klua.platform()
+    good("klua " .. klua.version .. " (" .. platform.os .. "/" .. platform.arch .. ")")
+
+    local dirs = {
+        { name = "config", path = klua.paths.config },
+        { name = "store", path = klua.paths.store },
+        { name = "bin", path = klua.paths.bin },
+        { name = "cache", path = klua.paths.cache },
+    }
+    for _, dir in ipairs(dirs) do
+        if not klua.mkdir(dir.path) then
+            bad(dir.name .. " directory could not be created: " .. dir.path)
+        elseif not dir_writable(dir.path) then
+            bad(dir.name .. " directory is not writable: " .. dir.path)
+        else
+            good(dir.name .. ": " .. dir.path)
+        end
+    end
+
+    if klua.file_exists(klua.paths.init) then
+        good("init.lua: " .. klua.paths.init)
+    else
+        warning("init.lua not materialized; using built-in defaults (run 'klua repair')")
+    end
+
+    local own_bin = normalize_dir(klua.paths.bin)
+    local in_path = false
+    for _, dir in ipairs(path_dirs()) do
+        if dir == own_bin then
+            in_path = true
+            break
+        end
+    end
+    if in_path then
+        good("PATH includes " .. klua.paths.bin)
+    else
+        warning("PATH does not include " .. klua.paths.bin
+            .. "; linked commands will not be discoverable")
+    end
+
+    local registries = all_registries()
+    if #registries == 0 then
+        warning("no registries configured; alias installs and search will fail")
+    else
+        for _, base in ipairs(registries) do
+            local url = strip_trailing_slash(base) .. "/v1/_.yaml"
+            local _, status, err = klua.http_get(url)
+            if err then
+                warning("registry unreachable: " .. base .. " (" .. err .. ")")
+            elseif status == 200 then
+                good("registry: " .. base)
+            else
+                warning("registry " .. base .. " returned HTTP " .. tostring(status))
+            end
+        end
+    end
+
+    local total, broken, libraries = 0, 0, 0
+    local links = {}
+    for _, entry in ipairs(klua.list_dir(klua.paths.bin)) do
+        if not entry.is_dir then
+            local target = klua.readlink(entry.path)
+            if target then
+                total = total + 1
+                links[#links + 1] = { name = entry.name, target = target }
+                if is_library_name(entry.name) then
+                    libraries = libraries + 1
+                elseif is_under_store(target) and not klua.file_exists(target) then
+                    broken = broken + 1
+                    warning("broken symlink: " .. entry.path .. " -> " .. target)
+                end
+            end
+        end
+    end
+    if broken == 0 then
+        good("symlinks: " .. total .. " managed link(s), none broken")
+    end
+    if libraries > 0 then
+        warning(libraries .. " shared library link(s) in " .. klua.paths.bin
+            .. "; libraries belong in the store (run 'klua cleanup')")
+    end
+
+    local shadowed = 0
+    for _, link in ipairs(links) do
+        local system_path = find_on_path(link.name)
+        if system_path then
+            shadowed = shadowed + 1
+            if CORE_COMMANDS[link.name] then
+                warning("'" .. link.name .. "' shadows protected command at " .. system_path)
+            else
+                warning("'" .. link.name .. "' shadows " .. system_path)
+            end
+        end
+    end
+    if shadowed == 0 then
+        good("no system commands are shadowed")
+    end
+
+    local packages = installed_packages()
+    good("store: " .. #packages .. " installed version(s)")
+
+    if problems > 0 then
+        klua.info("doctor: " .. problems .. " error(s), " .. warnings .. " warning(s)")
+        return 1
+    elseif warnings > 0 then
+        klua.info("doctor: no errors, " .. warnings .. " warning(s)")
+    else
+        klua.info("doctor: no problems found")
+    end
+    return 0
 end
 
 -- Read a sync source (local path or URL); returns content, error, resolved

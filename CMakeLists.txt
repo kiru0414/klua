@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(klua
-    VERSION 0.3.0
+    VERSION 0.4.0
     DESCRIPTION "A fast, self-healing package manager powered by C++20 and Lua 5.4"
     LANGUAGES C CXX)
 
