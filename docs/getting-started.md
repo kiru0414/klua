@@ -12,12 +12,10 @@ Static Linux binaries (x86_64, arm64) and macOS binaries are attached to
 every `v*` release:
 
 ```sh
-curl -fLO https://github.com/kiru0414/klua/releases/download/v0.3.0/klua-0.3.0-linux-x86_64.tar.gz
-tar -xzf klua*.tar.gz
-mkdir -p ~/.local/bin
-install -m 755 $(find . -maxdepth 2 -name klua -type f | head -n 1) ~/.local/bin/klua
+curl -LO https://github.com/kiru0414/klua/releases/latest/download/klua-v0.4.0-linux-x86_64.tar.gz
+tar -xzf klua-v0.4.0-linux-x86_64.tar.gz
+install -m 755 klua ~/.local/bin/klua   # or /usr/local/bin
 klua --version
-
 ```
 
 Make sure `~/.local/bin` is on your `PATH`:
@@ -68,14 +66,19 @@ relative layouts of complex tools survive.
 ## CLI
 
 ```
-klua install <target>...   (alias: klua i)
+klua install [--force] <target>...   (alias: klua i)
+klua run <target> [--] [args...]     # store-only execution, no symlink
+klua search <query>
+klua info <target>
+klua cleanup
+klua doctor
 klua add <target>...
 klua remove <target>...    (aliases: klua rm, klua uninstall)
 klua sync [path_or_url]
 klua upgrade [target...]
 klua tap <add|remove|list> [url]
 klua list
-klua repair
+klua repair [--dry-run|--diff]
 klua init-manifest [--force]
 klua --version | --help
 ```
@@ -89,6 +92,8 @@ $ klua --helo
 warning: unknown option '--helo'; did you mean '--help'?
 $ klua i bzp3
 warning: did you mean 'bzip3'?
+$ klua serach jq
+warning: unknown command 'serach'; did you mean 'search'?
 ```
 
 ### install / i
@@ -106,9 +111,67 @@ klua install fd                  # alias -> v1/f.yaml -> gh:sharkdp/fd
 Pipeline: direct scheme dispatch, or alias sharding lookup, then (for
 gh/gl) an in-repo [`klua.yaml`](klua-yaml.md) manifest check, then release
 asset scoring by OS/arch, download, extraction into the store, binary
-discovery (ELF/Mach-O magic or exec bits), `chmod +x`, symlink into
-`~/.local/bin`. See [taps-and-registry.md](taps-and-registry.md) for alias
-resolution.
+discovery (ELF/Mach-O magic or exec bits), `chmod +x`, conflict-checked
+symlink into `~/.local/bin`. See [taps-and-registry.md](taps-and-registry.md)
+for alias resolution.
+
+### Conflict safety
+
+Before creating any link, klua scans `PATH` and:
+
+- refuses to shadow protected core commands such as `git`, `curl`, `python`,
+  `python3`, `apt`, `sudo` and `klua` itself;
+- warns when a binary with the same name already exists on `PATH` or at the
+  link destination and is not managed by klua;
+- never links shared/static libraries (`.so`, `.so.*`, `.dylib`, `.a`, `.la`,
+  `.dll`) — they stay inside the store.
+
+A skipped link is not an install failure: the package remains staged in the
+store. Existing links that point into the store are replaced normally, so
+upgrades keep working. Pass `--force` to consciously override either guard:
+
+```sh
+klua install git            # warns and leaves ~/.local/bin/git alone
+klua install --force git    # creates the link anyway
+```
+
+### run
+
+```sh
+klua run jq --version
+klua run gh:jqlang/jq -r '.version'
+```
+
+`run` picks a non-library executable from the newest installed store version,
+installs the package store-only (no symlinks) if needed, and executes it with
+store `bin` directories prepended to `PATH` and store library directories on
+`LD_LIBRARY_PATH` (macOS: `DYLD_LIBRARY_PATH`). Arguments after the target —
+including flags — are passed through unchanged; use `--` to separate them
+explicitly.
+
+### search / info
+
+```sh
+klua search bzip3   # substring match in aliases and targets, all shards a-z + _
+klua info fd        # alias resolution, installed versions, links, release info
+```
+
+`search` walks every shard of every configured registry (taps first) and
+prints `alias<TAB>target` matches sorted by alias; the first registry that
+defines an alias wins. `info` works offline for local state and only emits a
+warning if release metadata cannot be fetched.
+
+### cleanup / doctor
+
+```sh
+klua cleanup        # keep newest version per package; remove stale links/caches
+klua doctor         # report dirs, PATH, registries, broken/shadowed links
+```
+
+Version ordering is digit-aware (`1.10.0` is newer than `1.9.0`). `cleanup`
+removes old store versions, symlinks pointing to missing store files, library
+links, and the `downloads/` and `build/` caches. `doctor` exits `1` only for
+real errors (e.g. unwritable directories); warnings are informational.
 
 ### add / sync
 
@@ -161,10 +224,16 @@ installed reports an error and changes nothing.
 
 ```sh
 klua repair
+klua repair --dry-run    # or: klua repair --diff
 ```
 
-Forcefully overwrites `~/.config/klua/init.lua` with the clean embedded
-baseline. Implemented natively in C++ — it works even when Lua is broken.
+Restores `~/.config/klua/init.lua` from the clean embedded baseline.
+Implemented natively in C++, so it works even when Lua is broken. Before
+overwriting, the current file is copied to
+`~/.config/klua/init.lua.bak.<timestamp>` and the backup path is printed —
+custom Lua is never silently destroyed. If the file already matches the
+baseline, nothing is written. `--dry-run` / `--diff` prints the backup path
+and a unified diff of the pending change and leaves all files untouched.
 
 ## Self-healing behavior
 

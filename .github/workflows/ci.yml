@@ -33,6 +33,9 @@ jobs:
       - name: UX tests (remove, typo suggestions)
         run: bash tests/test_ux.sh
 
+      - name: v0.4.0 tests (conflict safety, run, management, repair backup)
+        run: bash tests/test_v04.sh
+
   build-macos:
     name: Build (macOS arm64)
     runs-on: macos-14

@@ -51,7 +51,7 @@ run() { "$KLUA" "$@" >"$OUT" 2>&1; }
 # --- CLI basics -------------------------------------------------------------
 run --version
 check "--version exits 0" 0 $?
-expect_output "--version prints version" "klua 0.3.0"
+expect_output "--version prints version" "klua 0.4.0"
 
 run --help
 check "--help exits 0" 0 $?

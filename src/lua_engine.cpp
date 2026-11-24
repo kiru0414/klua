@@ -103,6 +103,25 @@ void LuaEngine::bind_natives() {
         return fs::exists(fs::path{path}, ec);
     });
 
+    k.set_function("is_dir", [](const std::string& path) {
+        std::error_code ec;
+        return fs::is_directory(fs::path{path}, ec);
+    });
+
+    // True for regular files with any execute bit set. Used for PATH scans
+    // before linking (conflict protection) and for doctor diagnostics.
+    k.set_function("is_executable", [](const std::string& path) {
+        std::error_code ec;
+        const fs::file_status status = fs::status(fs::path{path}, ec);
+        if (ec || !fs::is_regular_file(status)) {
+            return false;
+        }
+        const fs::perms perms = status.permissions();
+        return (perms & (fs::perms::owner_exec | fs::perms::group_exec
+                         | fs::perms::others_exec))
+            != fs::perms::none;
+    });
+
     k.set_function("read_file", [](const std::string& path) -> sol::optional<std::string> {
         std::ifstream in{fs::path{path}, std::ios::binary};
         if (!in) {

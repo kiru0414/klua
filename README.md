@@ -16,7 +16,7 @@ resolution logic, providers and lifecycle hooks are extensible in Lua.
 
 ## Status
 
-Milestones 1, 2 and 3 are implemented:
+Milestones 1, 2 and 3 plus the v0.4.0 management/safety release are implemented:
 
 **Milestone 1 — core skeleton**
 
@@ -28,9 +28,11 @@ Milestones 1, 2 and 3 are implemented:
   first, then `~/.config/klua/init.lua` runs in a protected call. If the user
   file has syntax or runtime errors, klua prints a clear English diagnostic
   and falls back to the embedded defaults.
-- `klua repair` forcefully restores `~/.config/klua/init.lua` from the
-  embedded baseline (implemented natively, so it works even when Lua is
-  broken).
+- `klua repair` restores `~/.config/klua/init.lua` from the embedded baseline
+  (implemented natively, so it works even when Lua is broken). It backs up
+  the existing file to `~/.config/klua/init.lua.bak.<timestamp>` first and
+  prints the backup path. `klua repair --dry-run` (`--diff`) previews the
+  backup path and a unified diff without changing any files.
 
 **Milestone 2 — fetcher & installer**
 
@@ -48,9 +50,6 @@ Milestones 1, 2 and 3 are implemented:
 - `gl:` (GitLab releases) and `url:` (direct download) providers.
 - `klua tap add/remove/list` manages registries in `taps.yaml` (deduplicated).
 - `klua list` enumerates installed packages from the store.
-
-Manifests (`klua.yaml`), `sync` and `upgrade` arrive in Milestone 3. See
-`AGENTS.md` for the full roadmap.
 
 **Milestone 3 — manifests, sync & release readiness**
 
@@ -76,6 +75,27 @@ Manifests (`klua.yaml`), `sync` and `upgrade` arrive in Milestone 3. See
   arm64) and macOS binaries (x86_64 + arm64) on `v*` tags and attaches
   them to the GitHub release.
 
+**v0.4.0 — conflict safety, isolated execution & management**
+
+- Before linking, klua scans `PATH`, refuses to shadow protected core
+  commands (`git`, `curl`, `python`, `python3`, `apt`, `sudo`, `klua`, …) and
+  warns about existing binaries. The package still installs into the store;
+  `klua install --force` explicitly overrides either guard.
+- Shared/static libraries (`.so`, `.so.*`, `.dylib`, `.a`, `.la`, `.dll`) are
+  never linked into `~/.local/bin/` — they remain isolated inside the store.
+- `klua run <target> [args...]` stages a missing package in the store without
+  creating links, then executes its binary with store `bin` directories on
+  `PATH` and store libraries on `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`.
+- `klua search <query>` searches all registry shards (`a`–`z` plus `_`);
+  `klua info <target>` reports resolution, installed versions, store path,
+  links and release metadata; `klua cleanup` prunes old versions, broken or
+  library links and caches; `klua doctor` checks dirs, PATH, registries and
+  links.
+- Levenshtein typo hints cover subcommands, flags and registry aliases,
+  including all of the new commands.
+- `klua repair` is non-destructive by default: it backs up custom Lua before
+  restoring the baseline, and `--dry-run` / `--diff` shows the pending change.
+
 See `AGENTS.md` for the full roadmap.
 
 ## Testing
@@ -84,6 +104,8 @@ See `AGENTS.md` for the full roadmap.
 bash tests/test_milestone1.sh   # offline: CLI, repair, self-healing, XDG
 bash tests/test_milestone2.sh   # network: taps, alias sharding, real installs
 bash tests/test_milestone3.sh   # add/sync/upgrade + local manifest & build tests
+bash tests/test_ux.sh           # remove, CLI/alias typo suggestions
+bash tests/test_v04.sh          # offline: conflict safety, run, management, repair
 ```
 
 ## Building (Linux / macOS)
@@ -111,6 +133,12 @@ klua tap add https://example.com/klua-registry  # register an alias registry
 klua install fd               # alias sharding -> v1/f.yaml -> gh:sharkdp/fd
 klua install gh:jqlang/jq     # direct GitHub Releases install
 klua i gh:jqlang/jq@jq-1.7.1  # pinned tag
+klua install --force git      # override shadowing/protected-command guard
+klua run jq --version         # execute from the store, no global symlink
+klua search jq                # search alias shards across all registries
+klua info jq                  # resolution, versions, links, release metadata
+klua cleanup                  # prune old versions, broken links and caches
+klua doctor                   # diagnose dirs, PATH, registries, links
 klua add gh:jqlang/jq fd      # record targets in packages.yaml
 klua sync                     # install everything in packages.yaml
 klua sync https://host/dotfiles.yaml  # remote source, follows includes:
@@ -118,7 +146,8 @@ klua upgrade                  # upgrade all installed packages
 klua remove fd                # delete symlinks, store dir, packages.yaml entry
 klua list                     # installed packages from the store
 klua init-manifest            # starter klua.yaml for a package repo
-klua repair                   # restore a clean ~/.config/klua/init.lua
+klua repair                   # back up and restore a clean init.lua
+klua repair --dry-run         # preview backup path and diff, change nothing
 ```
 
 ## Layout (XDG)
@@ -129,6 +158,9 @@ klua repair                   # restore a clean ~/.config/klua/init.lua
 | Store   | `~/.local/share/klua/store/<provider>/<user>/<repo>/<version>/` |
 | Bin     | `~/.local/bin/` (symlinks into the store)       |
 | Cache   | `~/.cache/klua/`                                |
+
+Libraries are never linked into `~/.local/bin/`; they stay inside the store
+and are exposed to `klua run` via `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`.
 
 `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_CACHE_HOME` overrides are honored.
 
@@ -145,8 +177,10 @@ end)
 ```
 
 Native primitives available to Lua: `klua.info/warn/error`,
-`klua.file_exists/read_file/write_file/mkdir/copy/remove/list_dir`,
+`klua.file_exists/is_dir/is_executable/read_file/write_file/mkdir/copy/remove/list_dir`,
 `klua.find_executables`, `klua.readlink`, `klua.env`, `klua.exec`,
 `klua.register_provider`, `klua.http_get/download`, `klua.extract/is_archive`,
 `klua.symlink`, `klua.chmod_exec`, `klua.json_parse/yaml_parse`,
-`klua.platform`, `klua.paths`, `klua.version`.
+`klua.platform`, `klua.paths`, `klua.version`. Set `klua.install_opts =
+{ force = ..., link = ... }` in a custom handler to control conflict
+overrides or request a store-only (run-only) install.

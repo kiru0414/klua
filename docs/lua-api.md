@@ -15,10 +15,11 @@ primitives below.
 
 | Name | Type | Meaning |
 | ---- | ---- | ------- |
-| `klua.version` | string | klua version, e.g. `"0.3.0"` |
+| `klua.version` | string | klua version, e.g. `"0.4.0"` |
 | `klua.paths` | table | `config`, `store`, `bin`, `cache`, `init`, `packages`, `taps` (absolute path strings) |
 | `klua.providers` | table | scheme -> `function(rest, target)` |
 | `klua.commands` | table | command name -> `function(args)` returning an exit code |
+| `klua.install_opts` | table | install-time flags: `force` (override link guards) and `link` (`false` = store-only install) |
 | `klua.registries` | array | registry base URLs for alias sharding (defaults to the official registry) |
 
 ### Service endpoint overrides
@@ -47,6 +48,8 @@ klua.error("message")   -- stderr, "error: " prefix
 | Function | Returns | Notes |
 | -------- | ------- | ----- |
 | `klua.file_exists(path)` | bool | |
+| `klua.is_dir(path)` | bool | true for directories (follows symlinks) |
+| `klua.is_executable(path)` | bool | true for regular files with any exec bit (used for PATH scans) |
 | `klua.read_file(path)` | string or nil | whole file, binary-safe |
 | `klua.write_file(path, content)` | ok, err | creates parent dirs, truncates |
 | `klua.mkdir(path)` | bool | recursive |
@@ -140,9 +143,10 @@ caught and reported; the install fails with exit 1.
 ## Command handlers
 
 The CLI dispatches `klua.commands.<name>(args)` where `args` is an array
-of positional strings. Names: `install`, `add`, `remove`, `sync`,
-`upgrade`, `tap`, `list`, `init-manifest` (note the dash:
-`klua.commands["init-manifest"]`). Return a process exit code. Override or
+of positional strings. Names: `install`, `run`, `search`, `info`, `cleanup`,
+`doctor`, `add`, `remove`, `sync`, `upgrade`, `tap`, `list`, `init-manifest`
+(note the dash: `klua.commands["init-manifest"]`). `run` receives the target
+plus all pass-through arguments. Return a process exit code. Override or
 wrap freely:
 
 ```lua
@@ -152,6 +156,41 @@ klua.commands.list = function(args)
     return default_list(args)
 end
 ```
+
+## Conflict-safe linking & run isolation
+
+The baseline routes every link through a local `safe_link` helper (in
+`builtin/default_init.lua`). It checks, in order:
+
+1. `klua.install_opts.link == false` → skip linking entirely (store-only).
+2. Library-looking names (`.so`, `.so.*`, `.dylib`, `.a`, `.la`, `.dll`) →
+   warn and leave the file inside the store.
+3. Existing non-klua links/files at the destination → warn and skip unless
+   `klua.install_opts.force` is set.
+4. Protected core command names (shells, coreutils, network tools, language
+   runtimes, compilers, system package managers, editors and `klua`) → warn
+   and skip unless forced.
+5. A same-named executable elsewhere on `PATH` → warn and skip unless forced.
+
+A skipped link still counts as success: the package is staged in the store.
+Links that already point into the store are replaced, so upgrades work. The
+CLI sets these options per invocation:
+
+```lua
+-- klua install --force ...
+klua.install_opts = { force = true, link = true }
+
+-- klua run ... (install missing package store-only)
+klua.install_opts = { force = false, link = false }
+```
+
+`klua run` executes the chosen binary through the shell with store `bin`
+directories prepended to `PATH` and store library directories prepended to
+`LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`; it uses `klua.is_dir` to discover
+library directories up to two levels deep and `shq()`-style single-quote
+escaping for every argument. Custom providers that create links themselves
+should respect `klua.install_opts.link` and perform equivalent conflict
+checks using `klua.readlink`, `klua.is_executable` and `klua.env("PATH")`.
 
 ## Recipes
 
@@ -168,6 +207,8 @@ klua.register_provider("corp", function(rest)
     if not ok then klua.error(tostring(err)); return 1 end
     for _, bin in ipairs(klua.find_executables(store)) do
         klua.chmod_exec(bin)
+        -- In production, guard this with the conflict checks described above
+        -- and respect klua.install_opts.link / .force.
         klua.symlink(bin, klua.paths.bin .. "/" .. bin:match("([^/]+)$"))
     end
     return 0
