@@ -19,8 +19,8 @@ Static Linux binaries (x86_64, arm64) and macOS binaries are attached to
 every `v*` release:
 
 ```sh
-curl -LO https://github.com/kiru0414/klua/releases/latest/download/klua-v0.6.0-linux-x86_64.tar.gz
-tar -xzf klua-v0.6.0-linux-x86_64.tar.gz
+curl -LO https://github.com/kiru0414/klua/releases/latest/download/klua-v0.7.0-linux-x86_64.tar.gz
+tar -xzf klua-v0.7.0-linux-x86_64.tar.gz
 install -m 755 klua ~/.local/bin/klua   # or /usr/local/bin
 klua --version
 ```
@@ -153,8 +153,15 @@ to `https://github.com/<user>/<repo>/releases/latest` and reads the
 (`gh:user/repo@v1.2.3`) skips the redirect and reads that tag's asset page
 directly. This avoids the unauthenticated REST limit entirely.
 
-The REST API is still used if the web endpoints fail. When the fallback runs,
-`GITHUB_TOKEN` or `GH_TOKEN` (in that order) is sent automatically as
+Release discovery is a fail-safe three-tier chain. If the expanded-assets page
+cannot be fetched or parses to **zero** download links, klua immediately reads
+`releases.atom` next. If the feed has no usable asset link either, it finally
+calls the REST API. An empty scrape is always a failure, never an empty
+success, so a changed GitHub layout cannot silently produce a broken install.
+Successful resolutions are cached for the rest of the invocation.
+
+When the REST tier runs, `GITHUB_TOKEN` or `GH_TOKEN` (in that order) is sent
+automatically as
 `Authorization: Bearer ...`. For a trusted custom API host, set
 `KLUA_GITHUB_API_HOST` to that hostname; the token is then limited to
 API-looking paths on that host.
@@ -170,7 +177,10 @@ downloads never receive them.
 
 Fetched `v1/<char>.yaml` shards are stored under `~/.cache/klua/shards/` with
 a one-hour TTL (`klua.shard_ttl` in `init.lua`). Repeated installs and
-`klua search` runs reuse the cached body. `--no-cache` forces a fresh fetch;
+`klua search` runs reuse the cached body. `klua search` sends every missing
+shard through `klua.http_get_batch`, a bounded C++20 worker pool with at most
+eight concurrent requests; results are cached in input order. `--no-cache`
+forces a fresh fetch;
 if a refresh fails, a stale entry is reused with a warning so you can still
 work offline.
 
@@ -193,9 +203,43 @@ klua install gh:jqlang/jq               # verifies automatically if a checksum e
 klua install --skip-checksum gh:jqlang/jq  # explicit bypass, warns and continues
 ```
 
+Locked installs are stricter: the SHA-256 recorded in `packages.lock.yaml` is
+always enforced (trust on first use). If upstream bytes change after the lock
+is written, `sync --locked` aborts on the hash mismatch before extraction —
+even if the lockfile itself was never edited. `--locked` and
+`--skip-checksum` cannot be combined.
+
 GitLab releases go through the same verification path. Registries and
 checksum files themselves are not signed; this protects against truncated or
 corrupted downloads, not maliciously published checksums.
+
+### Signature verification hook
+
+For signed artifacts, add `verify:` to `klua.yaml` (or set
+`klua.verify.command` in `init.lua`). The command runs after checksum
+verification and before extraction; a non-zero exit aborts the install.
+Placeholders `{payload}`, `{asset}`, `{version}`, `{target}` and `{sha256}`
+are substituted with shell-safe quoting, and the payload path is appended
+when the template does not name it:
+
+```yaml
+verify: "cosign verify-blob --signature {payload}.sig --certificate {payload}.pem {payload}"
+```
+
+```lua
+-- Global alternative in ~/.config/klua/init.lua
+klua.verify = {
+    command = "cosign verify-blob {payload}",
+    hook = function(ctx)
+        if ctx.sha256 == "" then return false end
+        return true
+    end,
+}
+```
+
+A manifest `verify: false` disables hooks for that package. Verification
+fails closed: a missing tool or a rejected hook stops the install. See
+[lua-api.md](lua-api.md#signature-verification).
 
 ### System package delegation
 
@@ -328,8 +372,13 @@ klua sync --locked               # reproduce exactly from the lockfile
 
 `packages.yaml` supports `includes:` (recursive, cycle-safe) and
 `packages:`; duplicate targets are installed once. A bare YAML list is
-also accepted as a source. See [Locked installs](#locked-installs) for lock
-semantics.
+also accepted as a source. When more than one archive must be fetched,
+`sync` resolves all targets first and then downloads them through
+`klua.download_batch` (the same bounded eight-worker pool used for shards),
+printing `batch: downloading N asset(s) in parallel`. Failed prefetches are
+retried by the normal provider path.
+
+See [Locked installs](#locked-installs) for lock semantics.
 
 ### upgrade
 
@@ -337,6 +386,9 @@ semantics.
 klua upgrade                     # every installed gh/gl package
 klua upgrade gh:jqlang/jq        # one target (aliases resolved too)
 ```
+
+`upgrade` uses the same parallel prefetch as `sync` when several packages are
+upgraded at once.
 
 Reinstalls the latest release and reports `upgraded X: old -> new` or
 `X is up to date (version)`. Add `--lock` to refresh locked entries for the

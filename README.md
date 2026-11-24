@@ -33,10 +33,16 @@ your `init.lua` can evolve every provider or command without recompiling.
 - **Verified downloads.** Matching `.sha256`, `.sha256sum` and `checksums.txt`
   assets are checked before extraction; a mismatch aborts the install unless
   `--skip-checksum` is explicitly given. Locked installs also verify the exact
-  SHA-256 recorded in `packages.lock.yaml`.
+  SHA-256 recorded in `packages.lock.yaml` — trust-on-first-use is strict, so a
+  changed upstream payload aborts even when the lockfile itself is untouched.
+  An optional `verify:` command hook can run `cosign verify-blob`, `gpg
+  --verify`, or any host tool before extraction.
 - **Reproducible installs.** `sync --lock` records versions, asset URLs and
   digests; `sync --locked` reproduces them without release discovery and fails
   on any mismatch.
+- **Parallel by default.** Registry shard fetches and multi-package archive
+  downloads share a bounded C++20 worker pool (at most eight requests at a
+  time), with results returned in input order.
 - **Self-evolving Lua customization.** The embedded baseline is always the
   fallback; your `init.lua` can override providers, command handlers and
   linking policy at runtime. `klua repair` now backs up custom Lua instead of
@@ -45,8 +51,8 @@ your `init.lua` can evolve every provider or command without recompiling.
 ## Status
 
 Milestones 1, 2 and 3 plus the v0.4.0 safety release, the v0.5.0
-resolution/verification release and the v0.6.0 delegation/reproducibility
-release are implemented:
+resolution/verification release, the v0.6.0 delegation/reproducibility
+release and the v0.7.0 performance/resilience release are implemented:
 
 **Milestone 1 — core skeleton**
 
@@ -172,6 +178,26 @@ release are implemented:
 - The starter registry now includes `ripgrep`, `fd`, `bat`, `eza`, `fzf`,
   `zoxide`, `starship`, `neovim`/`nvim`, `gh`, `lazygit` and `glab`.
 
+**v0.7.0 — parallel batching, resilient resolution & signature hooks**
+
+- Native `klua.http_get_batch(urls)` and `klua.download_batch(items)` use a
+  bounded C++20 thread pool (max 8 workers, one `httplib::Client` per worker).
+  `klua search` fetches missing shards in parallel; `klua sync` and
+  `klua upgrade` download all resolved archives concurrently. Results always
+  preserve the caller's input order.
+- GitHub release resolution is now a fail-safe three-tier chain: the
+  `releases/expanded_assets/<tag>` HTML scraper, then `releases.atom`, then the
+  REST API. A page that parses to **zero** assets is treated as a failure, so
+  it can no longer masquerade as an empty but successful release.
+- `packages.lock.yaml` is enforced as a trust-on-first-use pin: `sync --locked`
+  re-hashes the downloaded asset and aborts on any mismatch, preventing silent
+  upstream tampering. `--locked` cannot be combined with `--skip-checksum`.
+- An optional `verify:` command (in `klua.yaml` or `klua.verify.command` in
+  `init.lua`) runs after checksum verification and before extraction. Place
+  `{payload}`, `{asset}`, `{version}`, `{target}` and `{sha256}` in the command
+  template; a Lua `klua.verify.hook(context)` may inspect or reject the payload
+  directly. Verification fails closed.
+
 See `AGENTS.md` for the full roadmap.
 
 ## Testing
@@ -184,6 +210,7 @@ bash tests/test_ux.sh           # remove, CLI/alias typo suggestions
 bash tests/test_v04.sh          # offline: conflict safety, run, management, repair
 bash tests/test_v05.sh          # offline: API-free GitHub, shard cache, SHA-256
 bash tests/test_v06.sh          # offline: sys batching, tokens, lockfiles
+bash tests/test_v07.sh          # offline: parallel batches, 3-tier fallback, TOFU, verify
 ```
 
 ## Building (Linux / macOS)
@@ -217,7 +244,8 @@ klua install --no-cache fd    # refetch the registry shard instead of using cach
 klua install --skip-checksum jq  # bypass SHA-256 verification (explicit)
 klua install sys:git,curl     # skip installed packages; batch the rest
 klua sync --lock              # write versions, URLs and digests to the lockfile
-klua sync --locked            # reproduce exactly from packages.lock.yaml
+klua sync --locked            # reproduce exactly; abort on any hash mismatch
+klua install --locked gh:jqlang/jq  # TOFU: verify against the locked digest
 klua run jq --version         # execute from the store, no global symlink
 klua search jq                # search alias shards across all registries
 klua info jq                  # resolution, versions, links, release metadata
@@ -265,7 +293,8 @@ end)
 Native primitives available to Lua: `klua.info/warn/error`,
 `klua.file_exists/is_dir/is_executable/read_file/write_file/mkdir/copy/remove/list_dir`,
 `klua.find_executables`, `klua.readlink`, `klua.env`, `klua.exec`,
-`klua.register_provider`, `klua.http_get/http_head_redirect/download`,
+`klua.register_provider`,
+`klua.http_get/http_get_batch/http_head_redirect/download/download_batch`,
 `klua.sha256`, `klua.extract/is_archive`, `klua.symlink`, `klua.chmod_exec`,
 `klua.json_parse/yaml_parse`, `klua.platform`, `klua.paths`, `klua.version`.
 Set `klua.shard_ttl` to change the one-hour cache lifetime and

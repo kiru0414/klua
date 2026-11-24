@@ -1,7 +1,12 @@
 cmake_minimum_required(VERSION 3.24)
 
+# FetchContent dependencies still declare legacy minimum CMake versions.
+# Their deprecation notices are not actionable by klua and would otherwise
+# make a clean configure noisy. klua's own CMake uses current APIs.
+set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
+
 project(klua
-    VERSION 0.6.0
+    VERSION 0.7.0
     DESCRIPTION "A fast, self-healing package manager powered by C++20 and Lua 5.4"
     LANGUAGES C CXX)
 
@@ -29,7 +34,9 @@ endif()
 include(FetchContent)
 
 # OpenSSL supplies both HTTPS (cpp-httplib) and the EVP SHA-256 primitive.
+# Threads backs the bounded HTTP/download worker pool.
 find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Dependencies (fetched at configure time, no system packages required)
@@ -162,7 +169,8 @@ target_link_libraries(klua PRIVATE
     yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json
     httplib::httplib
-    OpenSSL::Crypto)
+    OpenSSL::Crypto
+    Threads::Threads)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(klua PRIVATE -Wall -Wextra -Wpedantic)

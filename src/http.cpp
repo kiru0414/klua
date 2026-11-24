@@ -2,13 +2,17 @@
 
 #include <httplib.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace klua::http {
 
@@ -132,6 +136,35 @@ httplib::Headers default_headers(const Url& url) {
     return headers;
 }
 
+// Run `fn(index)` for each index in [0, count) using at most eight workers.
+// Work is claimed through an atomic cursor, so slow requests do not block the
+// other workers even when the input order is uneven.
+template <typename Fn>
+void parallel_for(std::size_t count, Fn&& fn) {
+    if (count == 0) {
+        return;
+    }
+    constexpr std::size_t kMaxWorkers = 8;
+    const std::size_t workers = std::min(count, kMaxWorkers);
+    std::atomic<std::size_t> next{0};
+    std::vector<std::thread> threads;
+    threads.reserve(workers);
+    for (std::size_t worker = 0; worker < workers; ++worker) {
+        threads.emplace_back([&]() {
+            for (;;) {
+                const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
+                if (index >= count) {
+                    return;
+                }
+                fn(index);
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+}
+
 } // namespace
 
 Response get(const std::string& url) {
@@ -151,6 +184,20 @@ Response get(const std::string& url) {
     response.status = result->status;
     response.body = std::move(result->body);
     return response;
+}
+
+std::vector<Response> get_batch(const std::vector<std::string>& urls) {
+    std::vector<Response> responses(urls.size());
+    parallel_for(urls.size(), [&](std::size_t index) {
+        try {
+            responses[index] = get(urls[index]);
+        } catch (const std::exception& exception) {
+            responses[index].error = exception.what();
+        } catch (...) {
+            responses[index].error = "unknown error";
+        }
+    });
+    return responses;
 }
 
 HeadResponse head_redirect(const std::string& url) {
@@ -239,6 +286,22 @@ bool download(const std::string& url, const std::string& dest, std::string& erro
     fs::remove(target, ec);
     error = last_error;
     return false;
+}
+
+std::vector<DownloadResult> download_batch(const std::vector<DownloadItem>& items) {
+    std::vector<DownloadResult> results(items.size());
+    parallel_for(items.size(), [&](std::size_t index) {
+        try {
+            std::string error;
+            results[index].ok = download(items[index].url, items[index].dest, error);
+            results[index].error = std::move(error);
+        } catch (const std::exception& exception) {
+            results[index].error = exception.what();
+        } catch (...) {
+            results[index].error = "unknown error";
+        }
+    });
+    return results;
 }
 
 } // namespace klua::http

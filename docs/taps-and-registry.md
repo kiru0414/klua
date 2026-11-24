@@ -36,7 +36,9 @@ Successful `v1/<char>.yaml` responses are cached under
 `~/.cache/klua/shards/` (`$XDG_CACHE_HOME/klua/shards` when set). A sibling
 `.ts` file records the fetch time; entries younger than `klua.shard_ttl`
 (default one hour) are reused without contacting the registry, so repeated
-installs and `klua search` runs are instant.
+installs and `klua search` runs are instant. When shards are missing or stale,
+`klua search` fetches all of them through `klua.http_get_batch` — a bounded
+C++20 pool of at most eight workers — instead of one request at a time.
 
 ```sh
 klua install --no-cache fd   # refetch v1/f.yaml now

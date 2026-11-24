@@ -30,14 +30,18 @@ primitives below.
 - Rebind `klua.commands.run`, `klua.commands.search`, `klua.commands.info`,
   `klua.commands.cleanup`, `klua.commands.doctor` or `klua.commands.remove`
   just like any other handler — no rebuild required.
-- `gh:` resolution is API-free by default and verified checksums gate
-  extraction; both policies live in the baseline Lua and can be replaced.
+- `gh:` resolution is API-free by default and falls back through
+  `releases.atom` before the REST API; verified checksums and optional
+  signature hooks gate extraction. Both policies live in the baseline Lua and
+  can be replaced.
+- Independent HTTP requests use the bounded batch primitives so `search`,
+  `sync` and `upgrade` stay fast without creating unbounded threads.
 
 ## Globals
 
 | Name | Type | Meaning |
 | ---- | ---- | ------- |
-| `klua.version` | string | klua version, e.g. `"0.6.0"` |
+| `klua.version` | string | klua version, e.g. `"0.7.0"` |
 | `klua.paths` | table | `config`, `store`, `bin`, `cache`, `shards`, `init`, `packages`, `lock`, `taps` (absolute path strings) |
 | `klua.providers` | table | scheme -> `function(rest, target)` |
 | `klua.commands` | table | command name -> `function(args)` returning an exit code |
@@ -47,6 +51,7 @@ primitives below.
 | `klua.cli_flags` | table | `no_cache`, `skip_checksum`, `locked`, `lock`, published from CLI switches before dispatch |
 | `klua.system` | table | system package delegation overrides: `manager`, `status`, `install` |
 | `klua.lockfile` | table | parsed `packages.lock.yaml` state (`entries`, `loaded`) and lock helpers |
+| `klua.verify` | table | optional signature hooks: `command`, `hook` |
 
 ### Service endpoint overrides
 
@@ -124,8 +129,31 @@ local location, status, err = klua.http_head_redirect(
 -- HEAD without following redirects; Location may be "" on 200/404
 
 local ok, err = klua.download("https://host/tool.tar.gz", "/path/dest")
+
+-- Bounded parallel requests: at most 8 workers, one httplib::Client each.
+-- Results are returned in input order.
+local responses = klua.http_get_batch({
+    "http://host/v1/a.yaml",
+    "http://host/v1/b.yaml",
+})
+for _, response in ipairs(responses) do
+    -- { body = string, status = number, error = string|nil }
+end
+
+local results = klua.download_batch({
+    { url = "http://host/a.tar.gz", dest = "/cache/a.tar.gz" },
+    { url = "http://host/b.tar.gz", dest = "/cache/b.tar.gz" },
+})
+for _, result in ipairs(results) do
+    -- { url = ..., dest = ..., ok = bool, error = string|nil }
+end
 ```
 
+- `http_get_batch` and `download_batch` are the native batch primitives. They
+  are used by `klua search` for missing shards and by `klua sync` / `klua
+  upgrade` for concurrent archive downloads. Each item is fetched on its own
+  `httplib::Client`, and results preserve input order. A failed prefetch is
+  left for the normal provider to retry.
 - HTTPS via OpenSSL; `http_get` and `download` follow redirects across hosts.
 - `http_head_redirect` does **not** follow redirects and returns the raw
   `Location` header, used by the baseline for API-free tag discovery.
@@ -156,7 +184,9 @@ A mismatch produces `SHA-256 mismatch for <asset>` and an exit code of `1`
 before any store files are written. `klua.cli_flags.skip_checksum` (from
 `--skip-checksum`) bypasses verification with a warning. A locked install
 instead verifies the digest recorded in `packages.lock.yaml` and ignores
-release checksum sidecars; see [Lockfile](#lockfile).
+release checksum sidecars; see [Lockfile](#lockfile). Locked digests are never
+bypassed, even if a custom provider calls the helper directly — this is the
+trust-on-first-use guarantee that detects changed upstream bytes.
 
 ## System package delegation
 
@@ -228,12 +258,39 @@ access, use `entry.url` / `entry.version` when present, call `verify()` after
 download, and call `record()` with the resolved metadata when `--lock` is set.
 The built-in `gh:`, `gl:` and `url:` providers already do this. `--locked` is
 mutually exclusive with `--lock` and `--skip-checksum`; `sys:` and custom
-non-release schemes are not locked.
+non-release schemes are not locked. `verify()` always re-hashes the payload on
+a locked run and aborts on mismatch — TOFU is strict even if the lockfile was
+written earlier and the upstream asset has since changed.
+
+## Signature verification
+
+An optional verification stage runs after checksum verification and before
+extraction, so signature failures never leave partial store contents. A
+`verify:` field in `klua.yaml` (or `klua.verify.command` in `init.lua`) is a
+shell command template; `{payload}`, `{file}`, `{asset}`, `{version}`,
+`{target}` and `{sha256}` are replaced with shell-quoted values. The payload
+path is appended automatically when the template contains no file placeholder.
+`klua.verify.hook(context)` may also inspect the same fields and return
+`false`, a non-zero number, or raise an error to reject the payload.
+Verification fails closed: a missing tool, a non-zero command, or a rejecting
+hook aborts the install. Set `verify: false` in a manifest to disable hooks
+for that package.
+
+```lua
+klua.verify = {
+    command = "cosign verify-blob --certificate {payload}.pem {payload}",
+    hook = function(context)
+        return context.sha256 ~= ""
+    end,
+}
+```
 
 ## Registry shard cache
 
 `resolve_alias` and `klua.commands.search` share a local cache under
-`klua.paths.shards`. Each URL is hashed to a stable filename; a sibling `.ts`
+`klua.paths.shards`. `search` collects all missing shards and fetches them
+with `klua.http_get_batch` (max 8 concurrent requests) before parsing.
+Each URL is hashed to a stable filename; a sibling `.ts`
 file stores the fetch time. Entries younger than `klua.shard_ttl` (default
 3600 seconds) are reused without a network request. `--no-cache` sets
 `klua.cli_flags.no_cache = true` and forces a refetch; if the refetch fails,

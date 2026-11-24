@@ -209,6 +209,69 @@ void LuaEngine::bind_natives() {
                        return {false, error};
                    });
 
+    // Bounded parallel GET: array of URLs -> array of {body, status, error}.
+    // Results preserve input order; requests run on at most eight workers.
+    k.set_function("http_get_batch", [this](sol::table urls) {
+        std::vector<std::string> input;
+        const std::size_t count = urls.size();
+        input.reserve(count);
+        for (std::size_t index = 1; index <= count; ++index) {
+            sol::object value = urls[index];
+            if (!value.is<std::string>()) {
+                throw sol::error{"http_get_batch: every URL must be a string"};
+            }
+            input.push_back(value.as<std::string>());
+        }
+
+        const std::vector<http::Response> responses = http::get_batch(input);
+        sol::table result = lua_.create_table();
+        for (std::size_t index = 0; index < responses.size(); ++index) {
+            sol::table item = lua_.create_table();
+            item["body"] = responses[index].body;
+            item["status"] = responses[index].status;
+            if (responses[index].error.empty()) {
+                item["error"] = sol::nil;
+            } else {
+                item["error"] = responses[index].error;
+            }
+            result[static_cast<int>(index + 1)] = item;
+        }
+        return result;
+    });
+
+    // Bounded parallel downloads: array of {url=, dest=} ->
+    // array of {url=, dest=, ok=, error=}. Results preserve input order.
+    k.set_function("download_batch", [this](sol::table items) {
+        std::vector<http::DownloadItem> input;
+        const std::size_t count = items.size();
+        input.reserve(count);
+        for (std::size_t index = 1; index <= count; ++index) {
+            sol::table item = items[index];
+            sol::object url = item["url"];
+            sol::object dest = item["dest"];
+            if (!url.is<std::string>() || !dest.is<std::string>()) {
+                throw sol::error{"download_batch: every item needs string url and dest fields"};
+            }
+            input.push_back({url.as<std::string>(), dest.as<std::string>()});
+        }
+
+        const std::vector<http::DownloadResult> results = http::download_batch(input);
+        sol::table result = lua_.create_table();
+        for (std::size_t index = 0; index < results.size(); ++index) {
+            sol::table item = lua_.create_table();
+            item["url"] = input[index].url;
+            item["dest"] = input[index].dest;
+            item["ok"] = results[index].ok;
+            if (results[index].error.empty()) {
+                item["error"] = sol::nil;
+            } else {
+                item["error"] = results[index].error;
+            }
+            result[static_cast<int>(index + 1)] = item;
+        }
+        return result;
+    });
+
     // SHA-256 of a local file: returns (digest, err). Uses OpenSSL EVP.
     k.set_function("sha256",
                    [](const std::string& path)

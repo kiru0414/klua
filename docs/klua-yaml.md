@@ -41,6 +41,10 @@ comment-only, klua silently falls back to asset scoring.
   collected from the whole invocation and installed in one manager command;
   already-installed packages are skipped. `--lock` / `--locked` record and
   reproduce resolved versions, URLs and digests in `packages.lock.yaml`.
+- v0.7.0 adds `verify:` for an optional signature command that runs after
+  checksum verification and before extraction. Release discovery now falls
+  back through `releases.atom` before the REST API, and an empty
+  `expanded_assets` scrape is treated as a failure.
 - Custom Lua in `init.lua` can override the provider or command handlers that
   consume manifests. `klua repair` backs up your `init.lua` to
   `init.lua.bak.<timestamp>` before restoring the baseline; preview with
@@ -74,10 +78,32 @@ configs:                     # list of {src, dest} mappings
   - src: config.example.toml
     dest: ~/.config/mytool/config.toml
 
+verify:                      # optional signature/artifact command
+  - "cosign verify-blob --signature {payload}.sig {payload}"
+
 build:
   steps:                     # list of shell commands
     - cargo build --release
 ```
+
+## verify
+
+`verify` accepts a single command string, a list of commands, a mapping with a
+`command` field, or `false` to explicitly disable hooks. Commands run after
+checksum verification and before extraction; a non-zero exit aborts the
+install. `{payload}` / `{file}`, `{asset}`, `{version}`, `{target}` and
+`{sha256}` are replaced with shell-quoted values, and the payload path is
+appended when no file placeholder appears:
+
+```yaml
+verify: "cosign verify-blob --certificate {payload}.pem {payload}"
+```
+
+A global `klua.verify.command` in `init.lua` applies when the manifest has no
+`verify:` field, and `klua.verify.hook(context)` can reject the payload with
+`false`, a non-zero number, or an error. Verification fails closed — a missing
+tool or a rejected hook stops the install. See
+[lua-api.md](lua-api.md#signature-verification).
 
 ## assets
 

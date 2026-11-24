@@ -58,6 +58,10 @@ klua.system = klua.system or {}
 -- Reproducible lock state, populated lazily from packages.lock.yaml.
 klua.lockfile = klua.lockfile or {}
 
+-- Optional signature/artifact verification hooks. A manifest `verify:` field
+-- takes precedence; this table can provide a global command and/or Lua hook.
+klua.verify = klua.verify or {}
+
 -- Forward declarations: dependency hooks and the system batch flusher are
 -- defined below but called from the release providers.
 local install_one
@@ -382,33 +386,64 @@ local function shard_cache_key(url)
     return string.format("%016x", hash)
 end
 
-local function fetch_shard(url)
-    local flags = klua.cli_flags or {}
+local function shard_cache_paths(url)
     local key = shard_cache_key(url)
     local path = klua.paths.shards .. "/" .. key .. ".yaml"
-    local stamp_path = path .. ".ts"
+    return path, path .. ".ts"
+end
 
-    local cached_body = klua.read_file(path)
-    local cached_stamp = tonumber(klua.read_file(stamp_path) or "")
-    if cached_body and cached_stamp and not flags.no_cache then
-        if os.time() - cached_stamp < klua.shard_ttl then
-            return cached_body
+-- Fetch many shards through the bounded native worker pool. Fresh cache hits
+-- are served locally; all misses are requested together (at most 8 at once),
+-- then cached in input order. Returned table: url -> {body=...} or {error=...}.
+local function fetch_shards_batch(urls)
+    local flags = klua.cli_flags or {}
+    local results, stale, pending, pending_urls, seen = {}, {}, {}, {}, {}
+    for _, url in ipairs(urls) do
+        if not seen[url] then
+            seen[url] = true
+            local path, stamp_path = shard_cache_paths(url)
+            local cached_body = klua.read_file(path)
+            local cached_stamp = tonumber(klua.read_file(stamp_path) or "")
+            if cached_body and cached_stamp and not flags.no_cache
+                and os.time() - cached_stamp < klua.shard_ttl then
+                results[url] = { body = cached_body }
+            else
+                stale[url] = cached_body
+                pending_urls[#pending_urls + 1] = url
+            end
         end
     end
 
-    local body, status, err = klua.http_get(url)
-    if not err and status == 200 then
-        klua.write_file(path, body)
-        klua.write_file(stamp_path, tostring(os.time()))
-        return body
+    if #pending_urls > 0 then
+        local responses = klua.http_get_batch(pending_urls)
+        for index, url in ipairs(pending_urls) do
+            local response = responses[index] or { error = "missing batch response" }
+            if not response.error and response.status == 200 then
+                local path, stamp_path = shard_cache_paths(url)
+                klua.write_file(path, response.body)
+                klua.write_file(stamp_path, tostring(os.time()))
+                results[url] = { body = response.body }
+            elseif stale[url] and not flags.no_cache then
+                klua.warn("using stale cached shard for " .. url
+                    .. " (" .. tostring(response.error
+                        or ("HTTP " .. tostring(response.status))) .. ")")
+                results[url] = { body = stale[url], stale = true }
+            else
+                results[url] = {
+                    error = response.error or ("HTTP " .. tostring(response.status)),
+                }
+            end
+        end
     end
+    return results
+end
 
-    if cached_body and not flags.no_cache then
-        klua.warn("using stale cached shard for " .. url
-            .. " (" .. tostring(err or ("HTTP " .. tostring(status))) .. ")")
-        return cached_body
+local function fetch_shard(url)
+    local result = fetch_shards_batch({ url })[url]
+    if result and result.body then
+        return result.body
     end
-    return nil, err or ("HTTP " .. tostring(status))
+    return nil, (result and result.error) or "shard fetch failed"
 end
 
 -- ---------------------------------------------------------------------------
@@ -621,6 +656,43 @@ local function tag_from_location(location)
     return nil
 end
 
+local function github_parse_assets(body, web, tag_filter)
+    local assets, seen = {}, {}
+    for href in string.gmatch(body, [=[href=["']([^"']+)["']]=]) do
+        local path = string.match(html_unescape(href), "^([^?#]+)")
+        local asset_tag, asset_name
+        if path then
+            asset_tag, asset_name = string.match(path, "/releases/download/([^/]+)/([^/]+)$")
+        end
+        if asset_name and asset_name ~= ""
+            and (not tag_filter or asset_tag == tag_filter)
+            and not seen[asset_name] then
+            seen[asset_name] = true
+            assets[#assets + 1] = {
+                name = asset_name,
+                browser_download_url = absolute_url(web, path),
+            }
+        end
+    end
+    return assets
+end
+
+local function github_expanded_assets(web, user, name, tag)
+    local url = web .. "/" .. user .. "/" .. name .. "/releases/expanded_assets/" .. tag
+    local body, status, err = klua.http_get(url)
+    if err or status ~= 200 then
+        return nil, "could not fetch " .. url .. ": "
+            .. tostring(err or ("HTTP " .. tostring(status)))
+    end
+    local assets = github_parse_assets(body, web, tag)
+    if #assets == 0 then
+        -- Never treat an empty scrape as success: the caller must continue to
+        -- the Atom feed and then the REST API.
+        return nil, "0 assets parsed from " .. url
+    end
+    return assets
+end
+
 local function github_web_release(user, name, tag)
     local web = strip_trailing_slash(klua.github_web)
 
@@ -637,29 +709,120 @@ local function github_web_release(user, name, tag)
         end
     end
 
-    local url = web .. "/" .. user .. "/" .. name .. "/releases/expanded_assets/" .. tag
+    local assets, assets_err = github_expanded_assets(web, user, name, tag)
+    if not assets then
+        return nil, assets_err
+    end
+    return { tag_name = tag, assets = assets }
+end
+
+-- Atom tier: GitHub exposes recent releases as XML. It usually carries the
+-- tag (and sometimes release notes with download links) but not a reliable
+-- complete asset list, so when no assets are embedded we re-read the expanded
+-- assets page for the tag found in the feed.
+local function github_atom_release(user, name, tag)
+    local web = strip_trailing_slash(klua.github_web)
+    local url = web .. "/" .. user .. "/" .. name .. "/releases.atom"
     local body, status, err = klua.http_get(url)
     if err or status ~= 200 then
         return nil, "could not fetch " .. url .. ": "
             .. tostring(err or ("HTTP " .. tostring(status)))
     end
 
-    local assets, seen = {}, {}
-    for href in string.gmatch(body, [=[href=["']([^"']+)["']]=]) do
-        local path = string.match(html_unescape(href), "^([^?#]+)")
-        local asset_name = path and string.match(path, "/releases/download/[^/]+/([^/]+)$")
-        if asset_name and asset_name ~= "" and not seen[asset_name] then
-            seen[asset_name] = true
-            assets[#assets + 1] = {
-                name = asset_name,
-                browser_download_url = absolute_url(web, path),
-            }
+    local found
+    for entry in string.gmatch(body, "<entry[^>]*>(.-)</entry>") do
+        local entry_tag
+        for href in string.gmatch(entry, [=[href=["']([^"']+)["']]=]) do
+            local candidate = string.match(html_unescape(href), "/releases/tag/([^?#\"']+)")
+            if candidate then
+                candidate = string.gsub(candidate, "/+$", "")
+                if candidate ~= "" then
+                    entry_tag = candidate
+                    break
+                end
+            end
+        end
+        if entry_tag and not found then
+            found = entry_tag
+        end
+        if tag and entry_tag == tag then
+            found = tag
+            break
         end
     end
-    if #assets == 0 then
-        return nil, "no downloadable assets found at " .. url
+
+    if not found then
+        return nil, "no release entry for " .. (tag or "latest") .. " in " .. url
     end
-    return { tag_name = tag, assets = assets }
+    if tag and found ~= tag then
+        return nil, "requested tag '" .. tag .. "' is not present in " .. url
+    end
+
+    local assets = github_parse_assets(body, web, found)
+    if #assets == 0 then
+        local expanded, expanded_err = github_expanded_assets(web, user, name, found)
+        if not expanded then
+            return nil, expanded_err
+        end
+        assets = expanded
+    end
+    return { tag_name = found, assets = assets }
+end
+
+local function github_api_release(user, name, tag)
+    local endpoint = tag and ("tags/" .. tag) or "latest"
+    local api = klua.github_api .. "/repos/" .. user .. "/" .. name .. "/releases/" .. endpoint
+    local body, status, err = klua.http_get(api)
+    if err then
+        return nil, "request failed: " .. err
+    end
+    if status == 200 then
+        local release, json_err = klua.json_parse(body)
+        if not release then
+            return nil, "could not parse release JSON: " .. tostring(json_err)
+        end
+        return release
+    end
+    if status == 404 then
+        return nil, "no release at " .. api
+    end
+    return nil, "GitHub API returned HTTP " .. tostring(status)
+end
+
+-- Fail-safe resolution order: expanded_assets HTML -> releases.atom -> REST.
+-- Successful results are cached so a sync prefetch and the later install do
+-- not repeat the same discovery work.
+local github_release_cache = {}
+
+local function github_release_for(user, name, tag)
+    local web = strip_trailing_slash(klua.github_web)
+    local key = web .. "|" .. user .. "/" .. name .. "@" .. (tag or "latest")
+    local cached = github_release_cache[key]
+    if cached then
+        return cached.release, nil, cached.source
+    end
+
+    local release, web_err = github_web_release(user, name, tag)
+    if release then
+        github_release_cache[key] = { release = release, source = "web" }
+        return release, nil, "web"
+    end
+
+    local atom_release, atom_err = github_atom_release(user, name, tag)
+    if atom_release then
+        github_release_cache[key] = { release = atom_release, source = "atom" }
+        return atom_release, nil, "atom"
+    end
+
+    local api_release, api_err = github_api_release(user, name, tag)
+    if api_release then
+        github_release_cache[key] = { release = api_release, source = "api" }
+        return api_release, nil, "api"
+    end
+
+    return nil, "web: " .. tostring(web_err)
+        .. "; atom: " .. tostring(atom_err)
+        .. "; api: " .. tostring(api_err)
 end
 
 -- ---------------------------------------------------------------------------
@@ -775,8 +938,115 @@ local function verify_checksum(payload_path, asset_name, assets, label)
 end
 
 -- ---------------------------------------------------------------------------
+-- Optional signature/artifact verification
+--
+-- `verify:` in klua.yaml (or klua.verify.command in init.lua) runs after the
+-- SHA-256 check and before extraction. Commands may use {payload}, {file},
+-- {asset}, {version}, {target} and {sha256}; the payload is appended when no
+-- file placeholder is present. A Lua hook can inspect the same context.
+-- Verification fails closed: a missing tool or non-zero exit aborts install.
+-- ---------------------------------------------------------------------------
+
+local function verify_command_list(value)
+    if type(value) == "string" and value ~= "" then
+        return { value }
+    end
+    if type(value) == "table" then
+        if type(value.command) == "string" and value.command ~= "" then
+            return { value.command }
+        end
+        local commands = {}
+        for _, item in ipairs(value) do
+            if type(item) == "string" and item ~= "" then
+                commands[#commands + 1] = item
+            end
+        end
+        return commands
+    end
+    return {}
+end
+
+local function render_verify_command(template, context)
+    local rendered = template
+    local placeholders = {
+        payload = context.payload,
+        file = context.payload,
+        asset = context.asset,
+        version = context.version,
+        target = context.target,
+        sha256 = context.sha256,
+    }
+    local used_payload = false
+    for name, value in pairs(placeholders) do
+        local token = "{" .. name .. "}"
+        if string.find(rendered, token, 1, true) then
+            if name == "payload" or name == "file" then
+                used_payload = true
+            end
+            rendered = string.gsub(rendered, token,
+                function() return shq(tostring(value or "")) end)
+        end
+    end
+    if not used_payload then
+        rendered = rendered .. " " .. shq(context.payload)
+    end
+    return rendered
+end
+
+local function verify_payload(manifest, payload, asset_name, version, target, digest)
+    local configured = manifest and manifest.verify
+    if configured == false then
+        return 0
+    end
+    local global = klua.verify or {}
+    local commands = verify_command_list(configured)
+    if #commands == 0 then
+        commands = verify_command_list(global.command)
+    end
+    local hook = type(global.hook) == "function" and global.hook or nil
+    if #commands == 0 and not hook then
+        return 0
+    end
+
+    local context = {
+        payload = payload,
+        asset = asset_name,
+        version = tostring(version or ""),
+        target = target,
+        sha256 = tostring(digest or ""),
+        manifest = manifest,
+    }
+
+    if hook then
+        local ok, result = pcall(hook, context)
+        if not ok then
+            klua.error("verify hook failed for " .. asset_name .. ": " .. tostring(result))
+            return 1
+        end
+        if result == false or (type(result) == "number" and result ~= 0) then
+            klua.error("verify hook rejected " .. asset_name)
+            return 1
+        end
+    end
+
+    for _, template in ipairs(commands) do
+        local command = render_verify_command(template, context)
+        klua.info("verify: " .. command)
+        local code = klua.exec(command)
+        if code ~= 0 then
+            klua.error("verify command failed (exit " .. tostring(code) .. ") for " .. asset_name)
+            return 1
+        end
+    end
+    klua.info("verify: signature accepted for " .. asset_name)
+    return 0
+end
+
+-- ---------------------------------------------------------------------------
 -- In-repo klua.yaml manifests
 -- ---------------------------------------------------------------------------
+
+local manifest_cache = {}
 
 local function fetch_manifest(raw_base, user, name, tag, style)
     local ref = tag or "HEAD"
@@ -786,22 +1056,32 @@ local function fetch_manifest(raw_base, user, name, tag, style)
     else
         url = raw_base .. "/" .. user .. "/" .. name .. "/" .. ref .. "/klua.yaml"
     end
+    local key = (style or "github") .. "|" .. url
+    local cached = manifest_cache[key]
+    if cached ~= nil then
+        return cached or nil
+    end
+
     local body, status, err = klua.http_get(url)
     if err or status ~= 200 then
+        manifest_cache[key] = false
         return nil
     end
     local doc, parse_err = klua.yaml_parse(body)
     if parse_err then
         klua.warn("ignoring invalid klua.yaml: " .. parse_err)
+        manifest_cache[key] = false
         return nil
     end
     if doc == nil then
-        return {} -- comment-only manifest: valid, but no overrides
+        doc = {} -- comment-only manifest: valid, but no overrides
     end
     if type(doc) ~= "table" then
         klua.warn("ignoring klua.yaml: expected a mapping")
+        manifest_cache[key] = false
         return nil
     end
+    manifest_cache[key] = doc
     return doc
 end
 
@@ -1078,34 +1358,19 @@ local function github_install(rest, target_key)
             assets = {{ name = lock_entry.asset, browser_download_url = lock_entry.url }},
         }
     else
-        -- Resolve the latest tag from GitHub's web endpoints first: no
-        -- api.github.com request, so installs never hit the REST rate limit.
-        -- The API remains a fallback for layout changes or private repos.
-        local web_err
-        release, web_err = github_web_release(user, name, resolved_tag)
-        if release then
+        -- Fail-safe 3-tier discovery: web HTML, Atom feed, then REST API.
+        local release_err, source
+        release, release_err, source = github_release_for(user, name, resolved_tag)
+        if release and source == "web" then
             klua.info("gh: resolved " .. repo .. " " .. release.tag_name .. " from web release")
+        elseif release and source == "atom" then
+            klua.info("gh: resolved " .. repo .. " " .. release.tag_name
+                .. " from releases.atom")
+        elseif release then
+            klua.warn("gh: web/Atom discovery failed; falling back to GitHub API")
+            klua.info("gh: resolved " .. repo .. " " .. release.tag_name .. " from GitHub API")
         else
-            klua.warn("gh: web release discovery failed (" .. tostring(web_err)
-                .. "); falling back to GitHub API")
-            local endpoint = resolved_tag and ("tags/" .. resolved_tag) or "latest"
-            local api = klua.github_api .. "/repos/" .. user .. "/" .. name .. "/releases/" .. endpoint
-            local body, status, err = klua.http_get(api)
-            if err then
-                klua.error("gh: request failed: " .. err)
-                return 1
-            end
-            if status == 200 then
-                local json_err
-                release, json_err = klua.json_parse(body)
-                if not release then
-                    klua.error("gh: could not parse release JSON: " .. tostring(json_err))
-                    return 1
-                end
-            elseif status ~= 404 then
-                klua.error("gh: GitHub API returned HTTP " .. tostring(status))
-                return 1
-            end
+            klua.warn("gh: release discovery failed (" .. tostring(release_err) .. ")")
         end
     end
 
@@ -1139,18 +1404,21 @@ local function github_install(rest, target_key)
                 return 1
             end
 
+            local digest
             if lock_entry then
                 local code = verify_locked_digest(payload, asset.name, lock_entry, "gh:" .. repo)
                 if code ~= 0 then
                     return code
                 end
+                digest = lock_entry.sha256
             else
                 local code = verify_checksum(payload, asset.name, assets, "gh:" .. repo)
                 if code ~= 0 then
                     return code
                 end
                 if flags.lock then
-                    local digest, digest_err = klua.sha256(payload)
+                    local digest_err
+                    digest, digest_err = klua.sha256(payload)
                     if not digest or digest_err then
                         klua.error("could not compute SHA-256 for " .. asset.name .. ": "
                             .. tostring(digest_err))
@@ -1159,6 +1427,11 @@ local function github_install(rest, target_key)
                     record_lock_entry(key, "gh", version, asset.name,
                         asset.browser_download_url, digest)
                 end
+            end
+
+            local code = verify_payload(manifest, payload, asset.name, version, key, digest)
+            if code ~= 0 then
+                return code
             end
 
             local store_dir = klua.paths.store .. "/gh/" .. user .. "/" .. name .. "/" .. version
@@ -1195,6 +1468,37 @@ klua.register_provider("gh", github_install)
 -- GitLab provider: gl:user/repo[@tag]
 -- ---------------------------------------------------------------------------
 
+local gitlab_release_cache = {}
+
+local function gitlab_release_for(user, name, tag)
+    local key = strip_trailing_slash(klua.gitlab_api) .. "|" .. user .. "/" .. name
+        .. "@" .. (tag or "latest")
+    local cached = gitlab_release_cache[key]
+    if cached then
+        return cached
+    end
+
+    local project = user .. "%2F" .. name
+    local endpoint = tag and ("releases/" .. tag) or "releases/permalink/latest"
+    local api = klua.gitlab_api .. "/projects/" .. project .. "/" .. endpoint
+    local body, status, err = klua.http_get(api)
+    if err then
+        return nil, "request failed: " .. err
+    end
+    if status == 200 then
+        local release, json_err = klua.json_parse(body)
+        if not release then
+            return nil, "could not parse release JSON: " .. tostring(json_err)
+        end
+        gitlab_release_cache[key] = release
+        return release
+    end
+    if status == 404 then
+        return nil, "no release at " .. api
+    end
+    return nil, "GitLab API returned HTTP " .. tostring(status)
+end
+
 local function gitlab_install(rest, target_key)
     local repo, tag = string.match(rest, "^([^@]+)@(.+)$")
     if not repo then
@@ -1224,27 +1528,15 @@ local function gitlab_install(rest, target_key)
         klua.info("gl: using lockfile entry for " .. repo .. " " .. lock_entry.version)
         release = {
             tag_name = lock_entry.version,
-            assets = {{ name = lock_entry.asset, browser_download_url = lock_entry.url }},
+            assets = {
+                links = {{ name = lock_entry.asset, url = lock_entry.url }},
+            },
         }
     else
-        local project = user .. "%2F" .. name
-        local endpoint = resolved_tag and ("releases/" .. resolved_tag) or "releases/permalink/latest"
-        local api = klua.gitlab_api .. "/projects/" .. project .. "/" .. endpoint
-        local body, status, err = klua.http_get(api)
-        if err then
-            klua.error("gl: request failed: " .. err)
-            return 1
-        end
-        if status == 200 then
-            local json_err
-            release, json_err = klua.json_parse(body)
-            if not release then
-                klua.error("gl: could not parse release JSON: " .. tostring(json_err))
-                return 1
-            end
-        elseif status ~= 404 then
-            klua.error("gl: GitLab API returned HTTP " .. tostring(status))
-            return 1
+        local release_err
+        release, release_err = gitlab_release_for(user, name, resolved_tag)
+        if not release then
+            klua.warn("gl: release discovery failed (" .. tostring(release_err) .. ")")
         end
     end
 
@@ -1282,18 +1574,21 @@ local function gitlab_install(rest, target_key)
                 return 1
             end
 
+            local digest
             if lock_entry then
                 local code = verify_locked_digest(payload, asset_name, lock_entry, "gl:" .. repo)
                 if code ~= 0 then
                     return code
                 end
+                digest = lock_entry.sha256
             else
                 local code = verify_checksum(payload, asset_name, assets, "gl:" .. repo)
                 if code ~= 0 then
                     return code
                 end
                 if flags.lock then
-                    local digest, digest_err = klua.sha256(payload)
+                    local digest_err
+                    digest, digest_err = klua.sha256(payload)
                     if not digest or digest_err then
                         klua.error("could not compute SHA-256 for " .. asset_name .. ": "
                             .. tostring(digest_err))
@@ -1302,6 +1597,11 @@ local function gitlab_install(rest, target_key)
                     record_lock_entry(key, "gl", version, asset_name,
                         asset.browser_download_url, digest)
                 end
+            end
+
+            local code = verify_payload(manifest, payload, asset_name, version, key, digest)
+            if code ~= 0 then
+                return code
             end
 
             local store_dir = klua.paths.store .. "/gl/" .. user .. "/" .. name .. "/" .. version
@@ -1373,13 +1673,16 @@ local function url_install(rest, target_key)
         return 1
     end
 
+    local digest
     if lock_entry then
         local code = verify_locked_digest(payload, asset_name, lock_entry, "url")
         if code ~= 0 then
             return code
         end
+        digest = lock_entry.sha256
     elseif flags.lock then
-        local digest, digest_err = klua.sha256(payload)
+        local digest_err
+        digest, digest_err = klua.sha256(payload)
         if not digest or digest_err then
             klua.error("could not compute SHA-256 for " .. asset_name .. ": "
                 .. tostring(digest_err))
@@ -1388,11 +1691,236 @@ local function url_install(rest, target_key)
         record_lock_entry(key, "url", "direct", asset_name, download_url, digest)
     end
 
+    local code = verify_payload(nil, payload, asset_name, "direct", key, digest)
+    if code ~= 0 then
+        return code
+    end
+
     local store_dir = klua.paths.store .. "/url/" .. host .. "/" .. stem .. "/direct"
     return install_payload(payload, asset_name, store_dir, stem, nil)
 end
 
 klua.register_provider("url", url_install)
+
+-- ---------------------------------------------------------------------------
+-- Batch download prefetch (used by sync and upgrade)
+--
+-- Plans are resolved without extracting anything, then every archive URL is
+-- downloaded by the native bounded worker pool. The normal providers still
+-- run afterwards, but the download wrapper below returns the prefetched result
+-- so an asset is fetched exactly once.
+-- ---------------------------------------------------------------------------
+
+local native_download = klua.download
+local prefetched_downloads = {}
+
+local function prefetch_key(url, dest)
+    return url .. "\0" .. dest
+end
+
+local function download_cached(url, dest)
+    local result = prefetched_downloads[prefetch_key(url, dest)]
+    if result then
+        return result.ok, result.error
+    end
+    return native_download(url, dest)
+end
+klua.download = download_cached
+
+local function github_download_plan(rest, target_key)
+    local repo, tag = string.match(rest, "^([^@]+)@(.+)$")
+    if not repo then
+        repo = rest
+    end
+    local user, name = string.match(repo, "^([%w_.-]+)/([%w_.-]+)$")
+    if not user then
+        return nil
+    end
+    local key = target_key or ("gh:" .. repo)
+    local lock_entry, lock_failed = lock_entry_for(key, "gh")
+    if lock_failed or (lock_entry and tag and lock_entry.version ~= tag) then
+        return nil
+    end
+    local resolved_tag = tag or (lock_entry and lock_entry.version) or nil
+
+    local release
+    if lock_entry then
+        release = {
+            tag_name = lock_entry.version,
+            assets = {{ name = lock_entry.asset, browser_download_url = lock_entry.url }},
+        }
+    else
+        release = github_release_for(user, name, resolved_tag)
+    end
+    if not release then
+        return nil
+    end
+
+    local manifest = fetch_manifest(klua.raw_github, user, name, resolved_tag)
+    if release.tag_name and release.tag_name ~= resolved_tag then
+        manifest = fetch_manifest(klua.raw_github, user, name, release.tag_name) or manifest
+    end
+    local assets = release.assets or {}
+    local asset = lock_entry and assets[1]
+        or select_asset(assets, manifest, klua.platform())
+    if not asset or not asset.browser_download_url then
+        return nil
+    end
+    return {
+        url = asset.browser_download_url,
+        path = klua.paths.cache .. "/downloads/" .. asset.name,
+        label = "gh:" .. repo,
+    }
+end
+
+local function gitlab_download_plan(rest, target_key)
+    local repo, tag = string.match(rest, "^([^@]+)@(.+)$")
+    if not repo then
+        repo = rest
+    end
+    local user, name = string.match(repo, "^([%w_.-]+)/([%w_.-]+)$")
+    if not user then
+        return nil
+    end
+    local key = target_key or ("gl:" .. repo)
+    local lock_entry, lock_failed = lock_entry_for(key, "gl")
+    if lock_failed or (lock_entry and tag and lock_entry.version ~= tag) then
+        return nil
+    end
+    local resolved_tag = tag or (lock_entry and lock_entry.version) or nil
+
+    local release
+    if lock_entry then
+        release = {
+            tag_name = lock_entry.version,
+            assets = { links = {{ name = lock_entry.asset, url = lock_entry.url }} },
+        }
+    else
+        release = gitlab_release_for(user, name, resolved_tag)
+    end
+    if not release then
+        return nil
+    end
+
+    local manifest = fetch_manifest(klua.raw_gitlab, user, name, resolved_tag, "gitlab")
+    if release.tag_name and release.tag_name ~= resolved_tag then
+        manifest = fetch_manifest(klua.raw_gitlab, user, name, release.tag_name, "gitlab")
+            or manifest
+    end
+    local assets = {}
+    for _, link in ipairs((release.assets and release.assets.links) or {}) do
+        assets[#assets + 1] = { name = link.name or "", browser_download_url = link.url }
+    end
+    local asset = lock_entry and assets[1]
+        or select_asset(assets, manifest, klua.platform())
+    if not asset or not asset.browser_download_url then
+        return nil
+    end
+    local asset_name = basename(asset.browser_download_url or asset.name)
+    return {
+        url = asset.browser_download_url,
+        path = klua.paths.cache .. "/downloads/" .. asset_name,
+        label = "gl:" .. repo,
+    }
+end
+
+local function url_download_plan(rest, target_key)
+    if not string.match(rest, "^https?://") then
+        return nil
+    end
+    local key = target_key or ("url:" .. rest)
+    local lock_entry, lock_failed = lock_entry_for(key, "url")
+    if lock_failed then
+        return nil
+    end
+    local url = lock_entry and lock_entry.url or rest
+    local path_part = string.match(url, "^https?://[^/]+(/[^?#]*)") or "/"
+    local asset_name = lock_entry and lock_entry.asset or basename(path_part)
+    if not asset_name or asset_name == "" or asset_name == "/" then
+        return nil
+    end
+    return {
+        url = url,
+        path = klua.paths.cache .. "/downloads/" .. asset_name,
+        label = key,
+    }
+end
+
+local function plan_download(target)
+    local scheme, rest = string.match(target, "^([%w][%w+_-]*):(.+)$")
+    if not scheme then
+        local resolved = resolve_alias(target)
+        if not resolved then
+            return nil
+        end
+        return plan_download(resolved)
+    end
+    if scheme == "gh" then
+        return github_download_plan(rest, target)
+    elseif scheme == "gl" then
+        return gitlab_download_plan(rest, target)
+    elseif scheme == "url" then
+        return url_download_plan(rest, target)
+    end
+    return nil
+end
+
+local function prefetch_downloads(targets)
+    local by_path, order = {}, {}
+    for _, target in ipairs(targets) do
+        local job = plan_download(target)
+        if job then
+            local previous = by_path[job.path]
+            if previous == nil then
+                by_path[job.path] = job
+                order[#order + 1] = job.path
+            elseif previous and previous.url ~= job.url then
+                -- Two different assets share a cache filename; leave both to
+                -- the normal sequential provider path instead of racing.
+                by_path[job.path] = false
+            end
+        end
+    end
+
+    local jobs = {}
+    for _, path in ipairs(order) do
+        local job = by_path[path]
+        if job then
+            jobs[#jobs + 1] = job
+        end
+    end
+    if #jobs == 0 then
+        return
+    end
+
+    if #jobs == 1 then
+        local job = jobs[1]
+        local ok = native_download(job.url, job.path)
+        if ok then
+            prefetched_downloads[prefetch_key(job.url, job.path)] = { ok = true }
+        end
+        return
+    end
+
+    klua.info("batch: downloading " .. #jobs .. " asset(s) in parallel (max 8 workers)")
+    local requests = {}
+    for index, job in ipairs(jobs) do
+        requests[index] = { url = job.url, dest = job.path }
+    end
+    local results = klua.download_batch(requests)
+    for index, result in ipairs(results) do
+        local job = jobs[index]
+        if result.ok == true then
+            prefetched_downloads[prefetch_key(job.url, job.path)] = { ok = true }
+            klua.info("batch: " .. job.label .. " -> " .. basename(job.path))
+        else
+            -- Prefetch is best-effort: leave the cache empty so the normal
+            -- provider path retries sequentially and reports its own error.
+            klua.warn("batch download failed for " .. job.label .. ": "
+                .. tostring(result.error))
+        end
+    end
+end
 
 -- ---------------------------------------------------------------------------
 -- System package delegation (sys: and klua.yaml depends:)
@@ -1996,11 +2524,9 @@ local function save_lockfile()
 end
 
 verify_locked_digest = function(payload, asset_name, entry, label)
-    local flags = klua.cli_flags or {}
-    if flags.skip_checksum then
-        klua.warn("checksum verification skipped via --skip-checksum for " .. asset_name)
-        return 0
-    end
+    -- Locked digests are always enforced. --locked and --skip-checksum are
+    -- rejected by the CLI, and this helper must fail closed even if called
+    -- directly from custom Lua.
     local actual, err = klua.sha256(payload)
     if not actual or err then
         klua.error("could not compute SHA-256 for " .. asset_name .. ": " .. tostring(err))
@@ -2445,9 +2971,15 @@ function klua.commands.search(args)
     local reachable = 0
     for _, base in ipairs(registries) do
         local base_reachable = false
+        local urls = {}
+        for _, shard in ipairs(SEARCH_SHARDS) do
+            urls[#urls + 1] = strip_trailing_slash(base) .. "/v1/" .. shard .. ".yaml"
+        end
+        local bodies = fetch_shards_batch(urls)
         for _, shard in ipairs(SEARCH_SHARDS) do
             local url = strip_trailing_slash(base) .. "/v1/" .. shard .. ".yaml"
-            local body, err = fetch_shard(url)
+            local result = bodies[url] or { error = "shard fetch failed" }
+            local body = result.body
             if body then
                 base_reachable = true
                 local doc, parse_err = klua.yaml_parse(body)
@@ -2890,6 +3422,7 @@ function klua.commands.sync(args)
     local saved = klua.install_opts
     klua.install_opts = { force = false, link = true, _dependency_seen = {} }
     klua.info("syncing " .. #packages .. " package(s)")
+    prefetch_downloads(packages)
     local failed = 0
     for _, target in ipairs(packages) do
         if install_one(target) ~= 0 then
@@ -2948,6 +3481,7 @@ function klua.commands.upgrade(args)
 
     local saved = klua.install_opts
     klua.install_opts = { force = false, link = true, _dependency_seen = {} }
+    prefetch_downloads(targets)
     local status = 0
     for _, target in ipairs(targets) do
         local before = current_version(target)
