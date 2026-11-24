@@ -19,8 +19,8 @@ Static Linux binaries (x86_64, arm64) and macOS binaries are attached to
 every `v*` release:
 
 ```sh
-curl -LO https://github.com/kiru0414/klua/releases/latest/download/klua-v0.7.0-linux-x86_64.tar.gz
-tar -xzf klua-v0.7.0-linux-x86_64.tar.gz
+curl -LO https://github.com/kiru0414/klua/releases/latest/download/klua-v0.8.0-linux-x86_64.tar.gz
+tar -xzf klua-v0.8.0-linux-x86_64.tar.gz
 install -m 755 klua ~/.local/bin/klua   # or /usr/local/bin
 klua --version
 ```
@@ -63,12 +63,15 @@ On Windows, build inside WSL — POSIX is the only supported target.
 | ------- | ------- | -------- |
 | Config  | `~/.config/klua/` (`init.lua`, `packages.yaml`, `packages.lock.yaml`, `taps.yaml`) | `XDG_CONFIG_HOME` |
 | Store   | `~/.local/share/klua/store/<provider>/<user>/<repo>/<version>/` | `XDG_DATA_HOME` |
+| URL store | `~/.local/share/klua/store/url/<host>/<stem>-<url-hash>/direct/` | `XDG_DATA_HOME` |
 | Bin     | `~/.local/bin/<name>` (symlinks into the store) | none (always `~/.local/bin`) |
 | Cache   | `~/.cache/klua/` (`downloads/`, `checksums/`, `build/`, `shards/`) | `XDG_CACHE_HOME` |
 
 Overrides are honored only when absolute. Archives are extracted intact
 into the store (single top-level wrapper directories are stripped), so
-relative layouts of complex tools survive.
+relative layouts of complex tools survive. `<url-hash>` is the first 12 hex
+characters of the SHA-256 of the full canonical URL, which keeps same-named
+`url:` downloads from different paths isolated.
 
 ## Design philosophy
 
@@ -87,16 +90,17 @@ relative layouts of complex tools survive.
 ## CLI
 
 ```
-klua install [--force] [--as NAME] [--no-cache] [--skip-checksum] [--lock|--locked] <target>...  (alias: klua i)
-klua run [--no-cache] [--skip-checksum] <target> [--] [args...]  # store-only
+klua install [--force] [--as NAME] [--no-cache] [--skip-checksum] [--lock|--locked] [--yes] <target>...  (alias: klua i)
+klua run [--no-cache] [--skip-checksum] [--yes] [--upgrade|--latest] <target> [--] [args...]  # store-only
 klua search [--no-cache] <query>
 klua info [--no-cache] <target>
 klua cleanup [--no-cache]
 klua doctor [--no-cache]
 klua add <target>...
-klua remove [--no-cache] <target>...    (aliases: klua rm, klua uninstall)
-klua sync [--no-cache] [--skip-checksum] [--lock|--locked] [path_or_url]
-klua upgrade [--no-cache] [--skip-checksum] [--lock] [target...]
+klua remove [--no-cache] [--yes] <target>...    (aliases: klua rm, klua uninstall)
+klua sync [--no-cache] [--skip-checksum] [--lock|--locked] [--dry-run] [--yes] [path_or_url]
+klua upgrade [--no-cache] [--skip-checksum] [--lock] [--dry-run] [--yes] [target...]
+klua outdated [--no-cache] [target...]
 klua tap <add|remove|list> [url]
 klua list
 klua repair [--dry-run|--diff]
@@ -107,7 +111,8 @@ klua --version | --help
 Mistyped subcommands, flags, and aliases get a Levenshtein-based hint. The
 suggestion dictionary includes `install`, `run`, `search`, `info`, `cleanup`,
 `doctor`, `remove`/`rm`/`uninstall`, and flags such as `--force`, `--as`,
-`--no-cache`, `--skip-checksum`, `--lock`, `--locked`, `--dry-run` and `--diff`:
+`--no-cache`, `--skip-checksum`, `--lock`, `--locked`, `--dry-run`, `--diff`,
+`--yes`, `-y`, `--latest` and `--upgrade`:
 
 ```
 $ klua instll
@@ -241,6 +246,23 @@ A manifest `verify: false` disables hooks for that package. Verification
 fails closed: a missing tool or a rejected hook stops the install. See
 [lua-api.md](lua-api.md#signature-verification).
 
+### Remote command approval
+
+Commands from a remote `klua.yaml` are not trusted by default. Before running
+`build.steps` or a manifest `verify:` command, klua prints every command and
+asks for approval. Only `y` or `yes` is accepted; EOF (non-interactive stdin)
+and any other answer deny the request and abort the install. Scripts should
+pass `--yes` / `-y` to `install`, `remove`, `run`, `sync` or `upgrade`:
+
+```sh
+klua install gh:user/source-only-tool   # prompts before build.steps
+klua install --yes gh:user/source-only-tool
+klua sync -y
+```
+
+Local `init.lua` hooks are trusted; approval protects commands embedded in
+remote repository manifests. `--dry-run` skips both the prompt and execution.
+
 ### System package delegation
 
 `sys:pkg1,pkg2,...` and the explicit manager schemes (`apt:`, `apt-get:`,
@@ -294,6 +316,24 @@ hash mismatch fails the install. `--locked` is mutually exclusive with
 `upgrade --locked` is rejected because upgrading is the opposite of a locked
 reproduction. System packages and custom schemes are not locked.
 
+`klua remove` prunes matching entries from `packages.lock.yaml` even without
+`--lock`, so a later `sync --locked` does not reinstall an intentionally
+removed package. Custom handlers can call `klua.lockfile.prune(removed)`.
+
+### Dry-run previews
+
+`sync --dry-run` and `upgrade --dry-run` resolve their inputs and print what
+would happen — including the exact shell command generated for any missing
+`sys:` packages — without downloading archives, changing the store, creating
+links or writing the lockfile. `upgrade --dry-run` reports planned version
+changes as `v1.0.0 -> v2.0.0`. `--dry-run` is rejected with `--lock`; use it as
+a read-only planning step before the real command.
+
+```sh
+klua sync --dry-run                 # preview packages.yaml actions
+klua upgrade --dry-run gh:jqlang/jq # preview one upgrade
+```
+
 ### Conflict safety
 
 Before creating any link, klua scans `PATH` and:
@@ -326,6 +366,8 @@ chosen name.
 ```sh
 klua run jq --version
 klua run gh:jqlang/jq -r '.version'
+klua run --upgrade gh:jqlang/jq@jq-1.7.0   # ignore the pin; run the latest release
+klua run --latest jq                       # alias for --upgrade
 ```
 
 `run` picks a non-library executable from the newest installed store version,
@@ -333,7 +375,9 @@ installs the package store-only (no symlinks) if needed, and executes it with
 store `bin` directories prepended to `PATH` and store library directories on
 `LD_LIBRARY_PATH` (macOS: `DYLD_LIBRARY_PATH`). Arguments after the target —
 including flags — are passed through unchanged; use `--` to separate them
-explicitly.
+explicitly. Klua flags must appear **before** the target. `--upgrade` /
+`--latest` strip a pinned `@tag`, stage the newest release in the store, and
+run that binary without creating links.
 
 ### search / info
 
@@ -368,6 +412,7 @@ klua sync ./dotfiles.yaml        # explicit local source
 klua sync https://host/set.yaml  # remote source; follows includes:
 klua sync --lock                 # write versions/URLs/digests to the lockfile
 klua sync --locked               # reproduce exactly from the lockfile
+klua sync --dry-run              # preview actions without touching state
 ```
 
 `packages.yaml` supports `includes:` (recursive, cycle-safe) and
@@ -385,6 +430,9 @@ See [Locked installs](#locked-installs) for lock semantics.
 ```sh
 klua upgrade                     # every installed gh/gl package
 klua upgrade gh:jqlang/jq        # one target (aliases resolved too)
+klua upgrade --dry-run           # preview version changes and sys commands
+klua outdated                    # list packages with newer releases available
+klua outdated gh:jqlang/jq       # check one explicit target
 ```
 
 `upgrade` uses the same parallel prefetch as `sync` when several packages are
@@ -392,7 +440,10 @@ upgraded at once.
 
 Reinstalls the latest release and reports `upgraded X: old -> new` or
 `X is up to date (version)`. Add `--lock` to refresh locked entries for the
-newly resolved versions.
+newly resolved versions. `outdated` is read-only: it compares installed
+`gh:` / `gl:` versions with the newest release and prints
+`outdated: <target> <installed> -> <latest>` for each upgrade, or
+`outdated: all checked packages are up to date`.
 
 ### tap / list
 
@@ -415,8 +466,9 @@ Removal is complete: symlinks in `~/.local/bin` that point into the
 package's store directory are deleted, the store tree
 (`~/.local/share/klua/store/<provider>/<user>/<repo>/`) is removed, and
 matching entries in `packages.yaml` (bare alias, resolved target, or
-untagged scheme target) are pruned. Removing a package that is not
-installed reports an error and changes nothing.
+untagged scheme target) are pruned. Matching `packages.lock.yaml` entries
+are pruned too, so `--locked` cannot resurrect the removed package. Removing
+a package that is not installed reports an error and changes nothing.
 
 ### repair
 

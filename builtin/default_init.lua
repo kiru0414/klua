@@ -62,6 +62,12 @@ klua.lockfile = klua.lockfile or {}
 -- takes precedence; this table can provide a global command and/or Lua hook.
 klua.verify = klua.verify or {}
 
+-- v0.8.0 policy state: remote commands are approved once per invocation with
+-- --yes/-y or an explicit interactive confirmation. `last_install_version`
+-- lets `upgrade --dry-run` report the version a provider would install.
+local remote_consent = false
+local last_install_version = nil
+
 -- Forward declarations: dependency hooks and the system batch flusher are
 -- defined below but called from the release providers.
 local install_one
@@ -147,6 +153,61 @@ local function expand_home(path)
         return home .. string.sub(path, 2)
     end
     return path
+end
+
+-- v0.8.0 policy helpers -----------------------------------------------------
+
+local function dry_run()
+    return (klua.cli_flags or {}).dry_run == true
+end
+
+local function dry_run_notice(message)
+    klua.info("dry-run: " .. message)
+end
+
+-- Ask before executing shell commands that came from a remote klua.yaml.
+-- Locally configured init.lua hooks are trusted; remote ones are not.
+local function confirm_remote_commands(label, commands)
+    if (klua.cli_flags or {}).yes or remote_consent then
+        return true
+    end
+    klua.warn("remote klua.yaml wants to execute " .. label .. ":")
+    for _, command in ipairs(commands) do
+        klua.warn("  " .. tostring(command))
+    end
+    if klua.confirm("execute these remote commands? [y/N] ") then
+        remote_consent = true
+        klua.info("remote commands approved")
+        return true
+    end
+    klua.error("refusing remote " .. label .. " without confirmation (pass --yes / -y)")
+    return false
+end
+
+-- A short SHA-256 prefix of the full URL makes url: store directories unique
+-- even when different URLs share a host and file name.
+local function url_hash(url)
+    local digest = klua.sha256_text(url)
+    if type(digest) ~= "string" or #digest < 12 then
+        return nil
+    end
+    return string.sub(digest, 1, 12)
+end
+
+local function url_store_dir(download_url)
+    local path_part = string.match(download_url, "^https?://[^/]+(/[^?#]*)") or "/"
+    local asset_name = basename(path_part)
+    if asset_name == "" or asset_name == "/" then
+        return nil
+    end
+    local host = string.match(download_url, "^https?://([^/]+)") or "unknown-host"
+    local stem = string.gsub(asset_name, "%.[^.]+$", "")
+    stem = string.gsub(stem, "%.tar$", "")
+    local hash = url_hash(download_url)
+    if not hash then
+        return nil
+    end
+    return klua.paths.store .. "/url/" .. host .. "/" .. stem .. "-" .. hash .. "/direct"
 end
 
 -- ---------------------------------------------------------------------------
@@ -999,7 +1060,8 @@ local function verify_payload(manifest, payload, asset_name, version, target, di
         return 0
     end
     local global = klua.verify or {}
-    local commands = verify_command_list(configured)
+    local manifest_commands = verify_command_list(configured)
+    local commands = manifest_commands
     if #commands == 0 then
         commands = verify_command_list(global.command)
     end
@@ -1016,6 +1078,22 @@ local function verify_payload(manifest, payload, asset_name, version, target, di
         sha256 = tostring(digest or ""),
         manifest = manifest,
     }
+
+    if dry_run() then
+        for _, template in ipairs(commands) do
+            dry_run_notice("would verify " .. asset_name .. ": "
+                .. render_verify_command(template, context))
+        end
+        if hook then
+            dry_run_notice("would run verify hook for " .. asset_name)
+        end
+        return 0
+    end
+
+    if #manifest_commands > 0
+        and not confirm_remote_commands("verify command(s)", commands) then
+        return 1
+    end
 
     if hook then
         local ok, result = pcall(hook, context)
@@ -1171,6 +1249,10 @@ end
 -- (repo name for gh/gl, file stem for url). Archives are linked under the
 -- real binary's basename; raw binaries under the preferred name.
 local function install_payload(payload_path, asset_name, store_dir, preferred_name, manifest)
+    if dry_run() then
+        dry_run_notice("would install " .. asset_name .. " into " .. store_dir)
+        return 0
+    end
     local ok, err = klua.remove(store_dir)
     if not ok then
         klua.error("could not clean store directory: " .. tostring(err))
@@ -1231,6 +1313,20 @@ end
 -- ---------------------------------------------------------------------------
 
 local function build_from_source(clone_base, user, name, tag, manifest, store_dir)
+    local steps = manifest.build.steps
+    if dry_run() then
+        local repo = clone_base .. "/" .. user .. "/" .. name .. ".git"
+        dry_run_notice("would clone " .. repo)
+        for _, step in ipairs(steps) do
+            dry_run_notice("would run build step: " .. step)
+        end
+        dry_run_notice("would install built binaries into " .. store_dir)
+        return 0
+    end
+    if #steps > 0 and not confirm_remote_commands("build.steps", steps) then
+        return 1
+    end
+
     local clone_dir = klua.paths.cache .. "/build/" .. user .. "-" .. name
     local ok, err = klua.remove(clone_dir)
     if not ok then
@@ -1393,11 +1489,20 @@ local function github_install(rest, target_key)
 
     if release then
         local version = release.tag_name or resolved_tag or "unknown"
+        last_install_version = version
         local assets = release.assets or {}
         local asset = lock_entry and assets[1] or select_asset(assets, manifest, klua.platform())
         if asset then
             klua.info("gh: " .. repo .. " " .. version .. " -> " .. asset.name)
             local payload = klua.paths.cache .. "/downloads/" .. asset.name
+            if dry_run() then
+                local code = verify_payload(manifest, payload, asset.name, version, key, nil)
+                if code ~= 0 then
+                    return code
+                end
+                local store_dir = klua.paths.store .. "/gh/" .. user .. "/" .. name .. "/" .. version
+                return install_payload(payload, asset.name, store_dir, name, manifest)
+            end
             local ok, dl_err = klua.download(asset.browser_download_url, payload)
             if not ok then
                 klua.error("gh: download failed: " .. tostring(dl_err))
@@ -1448,6 +1553,7 @@ local function github_install(rest, target_key)
             return code
         end
         local version = resolved_tag or "source"
+        last_install_version = version
         local store_dir = klua.paths.store .. "/gh/" .. user .. "/" .. name .. "/" .. version
         return build_from_source(klua.github_clone, user, name, resolved_tag, manifest, store_dir)
     end
@@ -1558,6 +1664,7 @@ local function gitlab_install(rest, target_key)
 
     if release then
         local version = release.tag_name or resolved_tag or "unknown"
+        last_install_version = version
         -- Normalize GitLab asset links into the GitHub asset shape.
         local assets = {}
         for _, link in ipairs((release.assets and release.assets.links) or {}) do
@@ -1568,6 +1675,14 @@ local function gitlab_install(rest, target_key)
             klua.info("gl: " .. repo .. " " .. version .. " -> " .. asset.name)
             local asset_name = basename(asset.browser_download_url or asset.name)
             local payload = klua.paths.cache .. "/downloads/" .. asset_name
+            if dry_run() then
+                local code = verify_payload(manifest, payload, asset_name, version, key, nil)
+                if code ~= 0 then
+                    return code
+                end
+                local store_dir = klua.paths.store .. "/gl/" .. user .. "/" .. name .. "/" .. version
+                return install_payload(payload, asset_name, store_dir, name, manifest)
+            end
             local ok, dl_err = klua.download(asset.browser_download_url, payload)
             if not ok then
                 klua.error("gl: download failed: " .. tostring(dl_err))
@@ -1616,6 +1731,7 @@ local function gitlab_install(rest, target_key)
             return code
         end
         local version = resolved_tag or "source"
+        last_install_version = version
         local store_dir = klua.paths.store .. "/gl/" .. user .. "/" .. name .. "/" .. version
         return build_from_source(klua.gitlab_clone, user, name, resolved_tag, manifest, store_dir)
     end
@@ -1661,12 +1777,28 @@ local function url_install(rest, target_key)
         klua.error("url: could not derive a file name from '" .. download_url .. "'")
         return 1
     end
-    local host = string.match(download_url, "^https?://([^/]+)") or "unknown-host"
     local stem = string.gsub(asset_name, "%.[^.]+$", "")
     stem = string.gsub(stem, "%.tar$", "")
+    -- The store identity follows the canonical target, not a redirected or
+    -- lockfile-supplied download URL, so info/remove can derive the same path.
+    local store_dir = url_store_dir(rest)
+    if not store_dir then
+        klua.error("url: could not derive a store path for '" .. rest .. "'")
+        return 1
+    end
+    last_install_version = "direct"
+    local payload = klua.paths.cache .. "/downloads/" .. asset_name
+
+    if dry_run() then
+        dry_run_notice("would download " .. download_url)
+        local code = verify_payload(nil, payload, asset_name, "direct", key, nil)
+        if code ~= 0 then
+            return code
+        end
+        return install_payload(payload, asset_name, store_dir, stem, nil)
+    end
 
     klua.info("url: downloading " .. download_url)
-    local payload = klua.paths.cache .. "/downloads/" .. asset_name
     local ok, dl_err = klua.download(download_url, payload)
     if not ok then
         klua.error("url: download failed: " .. tostring(dl_err))
@@ -1696,7 +1828,6 @@ local function url_install(rest, target_key)
         return code
     end
 
-    local store_dir = klua.paths.store .. "/url/" .. host .. "/" .. stem .. "/direct"
     return install_payload(payload, asset_name, store_dir, stem, nil)
 end
 
@@ -2052,7 +2183,45 @@ local function sudo_prefix(manager)
     return ""
 end
 
+-- Build the exact command a manager would run. Returns nil for a custom Lua
+-- installer (there is no shell command to preview in that case).
+local function system_command_for(manager, packages)
+    if type(klua.system.install) == "function" then
+        return nil
+    end
+    if type(klua.system.install_cmd) == "string" then
+        local quoted = {}
+        for _, pkg in ipairs(packages) do
+            quoted[#quoted + 1] = shq(pkg)
+        end
+        return string.format(klua.system.install_cmd, table.concat(quoted, " "))
+    end
+    local spec = SYSTEM_MANAGERS[manager]
+    if not spec then
+        return nil
+    end
+    local quoted = {}
+    for _, pkg in ipairs(packages) do
+        quoted[#quoted + 1] = shq(pkg)
+    end
+    local prefix = sudo_prefix(manager)
+    if spec.install_bin and klua.exec("command -v " .. spec.install_bin .. " >/dev/null 2>&1") ~= 0 then
+        return nil
+    end
+    return prefix .. string.format(spec.install, table.concat(quoted, " "))
+end
+
 local function install_system_batch(manager, packages)
+    if dry_run() then
+        local command = system_command_for(manager, packages)
+        if command then
+            dry_run_notice("would run: " .. command)
+        else
+            dry_run_notice("would call the configured system installer for: "
+                .. table.concat(packages, ", "))
+        end
+        return 0
+    end
     if type(klua.system.install) == "function" then
         local result = klua.system.install(packages)
         return result == true and 0 or (type(result) == "number" and result or 1)
@@ -2116,11 +2285,19 @@ flush_system_packages = function()
         return 0
     end
 
-    klua.info("sys: installing " .. #missing .. " missing package(s) with " .. manager
-        .. ": " .. table.concat(missing, ", "))
+    if dry_run() then
+        dry_run_notice("would install " .. #missing .. " missing package(s) with " .. manager
+            .. ": " .. table.concat(missing, ", "))
+    else
+        klua.info("sys: installing " .. #missing .. " missing package(s) with " .. manager
+            .. ": " .. table.concat(missing, ", "))
+    end
     if install_system_batch(manager, missing) ~= 0 then
         klua.error("sys: failed to install package(s): " .. table.concat(missing, ", "))
         return 1
+    end
+    if dry_run() then
+        return 0
     end
 
     local failed = {}
@@ -2487,14 +2664,7 @@ record_lock_entry = function(target, provider, version, asset, url, sha256)
     }
 end
 
-local function save_lockfile()
-    local flags = klua.cli_flags or {}
-    if not flags.lock then
-        return 0
-    end
-    if not load_lockfile() then
-        return 1
-    end
+local function write_lockfile()
     local keys = {}
     for key in pairs(klua.lockfile.entries) do
         keys[#keys + 1] = key
@@ -2523,6 +2693,53 @@ local function save_lockfile()
     return 0
 end
 
+local function save_lockfile()
+    local flags = klua.cli_flags or {}
+    if not flags.lock then
+        return 0
+    end
+    if dry_run() then
+        dry_run_notice("would update lockfile " .. klua.paths.lock)
+        return 0
+    end
+    if not load_lockfile() then
+        return 1
+    end
+    return write_lockfile()
+end
+
+-- Removing a package must not leave a stale pin behind: a later --locked run
+-- would otherwise reinstall something the user deliberately uninstalled.
+local function prune_lockfile(removed)
+    if not klua.file_exists(klua.paths.lock) then
+        return true
+    end
+    if not load_lockfile() then
+        return false
+    end
+    local dropped = 0
+    for key in pairs(removed) do
+        local canonical = canonical_lock_target(key)
+        if klua.lockfile.entries[canonical] then
+            klua.lockfile.entries[canonical] = nil
+            dropped = dropped + 1
+        end
+    end
+    if dropped == 0 then
+        return true
+    end
+    if dry_run() then
+        dry_run_notice("would remove " .. dropped .. " lock entry/entries from "
+            .. klua.paths.lock)
+        return true
+    end
+    if write_lockfile() ~= 0 then
+        return false
+    end
+    klua.info("lockfile pruned: " .. dropped .. " entry/entries removed")
+    return true
+end
+
 verify_locked_digest = function(payload, asset_name, entry, label)
     -- Locked digests are always enforced. --locked and --skip-checksum are
     -- rejected by the CLI, and this helper must fail closed even if called
@@ -2548,6 +2765,7 @@ klua.lockfile.get = lock_entry_for
 klua.lockfile.record = record_lock_entry
 klua.lockfile.verify = verify_locked_digest
 klua.lockfile.save = save_lockfile
+klua.lockfile.prune = prune_lockfile
 
 -- ---------------------------------------------------------------------------
 -- Command handlers
@@ -2645,15 +2863,7 @@ local function store_path_for(scheme, rest)
         end
         return klua.paths.store .. "/" .. scheme .. "/" .. user .. "/" .. name
     elseif scheme == "url" then
-        local path_part = string.match(rest, "^https?://[^/]+(/[^?#]*)") or "/"
-        local asset_name = basename(path_part)
-        if asset_name == "" or asset_name == "/" then
-            return nil
-        end
-        local host = string.match(rest, "^https?://([^/]+)") or "unknown-host"
-        local stem = string.gsub(asset_name, "%.[^.]+$", "")
-        stem = string.gsub(stem, "%.tar$", "")
-        return klua.paths.store .. "/url/" .. host .. "/" .. stem .. "/direct"
+        return url_store_dir(rest)
     end
     return nil
 end
@@ -2741,6 +2951,9 @@ function klua.commands.remove(args)
     end
 
     if next(removed) and not prune_packages(removed) then
+        return 1
+    end
+    if next(removed) and not prune_lockfile(removed) then
         return 1
     end
     return status
@@ -2887,14 +3100,57 @@ end
 
 function klua.commands.run(args)
     if #args == 0 then
-        klua.error("usage: klua run <target> [--] [args...]")
+        klua.error("usage: klua run [--upgrade|--latest] <target> [--] [args...]")
         return 1
     end
 
-    local target = args[1]
+    -- `run` is a CLI11 prefix command: everything after it arrives here
+    -- verbatim. Consume only klua flags that appear *before* the target so
+    -- flags after the target keep flowing through to the executed binary.
+    local flags = klua.cli_flags or {}
+    local refresh = flags.latest == true or flags.upgrade == true
+    local index = 1
+    while index <= #args do
+        local token = args[index]
+        if token == "--upgrade" then
+            refresh, flags.upgrade = true, true
+        elseif token == "--latest" then
+            refresh, flags.latest = true, true
+        elseif token == "--yes" or token == "-y" then
+            flags.yes = true
+        elseif token == "--no-cache" then
+            flags.no_cache = true
+        elseif token == "--skip-checksum" then
+            flags.skip_checksum = true
+        elseif token == "--" then
+            index = index + 1
+            break
+        else
+            break
+        end
+        index = index + 1
+    end
+
+    local target = args[index]
+    if not target then
+        klua.error("usage: klua run [--upgrade|--latest] <target> [--] [args...]")
+        return 1
+    end
     local extra = {}
-    for index = 2, #args do
-        extra[#extra + 1] = args[index]
+    for position = index + 1, #args do
+        extra[#extra + 1] = args[position]
+    end
+
+    -- --upgrade / --latest intentionally ignore a pinned @tag so the newest
+    -- release is staged before the binary is executed.
+    if refresh then
+        local pinned_scheme, pinned_rest = string.match(target, "^([%w][%w+_-]*):(.+)$")
+        if pinned_scheme then
+            local untagged = string.match(pinned_rest, "^([^@]+)")
+            if untagged and untagged ~= pinned_rest then
+                target = pinned_scheme .. ":" .. untagged
+            end
+        end
     end
 
     local scheme, rest, resolved, err = resolve_target(target)
@@ -2904,6 +3160,10 @@ function klua.commands.run(args)
     end
 
     local dir = package_dir_for(scheme, rest)
+    if refresh then
+        klua.info("run: checking latest release for '" .. target .. "'")
+        dir = nil
+    end
     if not dir then
         klua.info("installing '" .. target .. "' for this run (store only, no links)")
         local saved = klua.install_opts
@@ -3421,8 +3681,12 @@ function klua.commands.sync(args)
 
     local saved = klua.install_opts
     klua.install_opts = { force = false, link = true, _dependency_seen = {} }
-    klua.info("syncing " .. #packages .. " package(s)")
-    prefetch_downloads(packages)
+    if dry_run() then
+        dry_run_notice("would sync " .. #packages .. " package(s)")
+    else
+        klua.info("syncing " .. #packages .. " package(s)")
+        prefetch_downloads(packages)
+    end
     local failed = 0
     for _, target in ipairs(packages) do
         if install_one(target) ~= 0 then
@@ -3440,7 +3704,11 @@ function klua.commands.sync(args)
         klua.error("sync finished with " .. failed .. " failure(s)")
         return 1
     end
-    klua.info("sync complete: " .. #packages .. " package(s)")
+    if dry_run() then
+        dry_run_notice("sync preview complete: " .. #packages .. " package(s); no changes made")
+    else
+        klua.info("sync complete: " .. #packages .. " package(s)")
+    end
     return 0
 end
 
@@ -3481,17 +3749,29 @@ function klua.commands.upgrade(args)
 
     local saved = klua.install_opts
     klua.install_opts = { force = false, link = true, _dependency_seen = {} }
-    prefetch_downloads(targets)
+    if not dry_run() then
+        prefetch_downloads(targets)
+    end
     local status = 0
     for _, target in ipairs(targets) do
         local before = current_version(target)
-        klua.info("upgrading " .. target .. " ...")
+        last_install_version = nil
+        if dry_run() then
+            dry_run_notice("would upgrade " .. target .. " ...")
+        else
+            klua.info("upgrading " .. target .. " ...")
+        end
         local code = install_one(target)
         if code ~= 0 then
             status = 1
         else
             local after = current_version(target)
-            if before and after and before ~= after then
+            local planned = last_install_version or after or before
+            if dry_run() then
+                dry_run_notice("would change " .. target .. ": "
+                    .. tostring(before or "not installed") .. " -> "
+                    .. tostring(planned or "unknown"))
+            elseif before and after and before ~= after then
                 klua.info("upgraded " .. target .. ": " .. before .. " -> " .. after)
             else
                 klua.info(target .. " is up to date (" .. tostring(after or before or "unknown") .. ")")
@@ -3505,6 +3785,110 @@ function klua.commands.upgrade(args)
         status = 1
     end
     klua.install_opts = saved
+    return status
+end
+
+-- ---------------------------------------------------------------------------
+-- klua outdated [targets...]
+-- ---------------------------------------------------------------------------
+
+local function strip_target_tag(target)
+    local scheme, rest = string.match(target, "^([%w][%w+_-]*):(.+)$")
+    if not scheme then
+        return target
+    end
+    local untagged = string.match(rest, "^([^@]+)") or rest
+    return scheme .. ":" .. untagged
+end
+
+local function latest_release_version(target)
+    local scheme, rest = string.match(target, "^([%w][%w+_-]*):(.+)$")
+    if scheme ~= "gh" and scheme ~= "gl" then
+        return nil, "only gh: and gl: packages can be checked"
+    end
+    local user, name = string.match(rest, "^([^/@]+)/([^/@]+)")
+    if not user then
+        return nil, "expected user/repo after '" .. scheme .. ":'"
+    end
+
+    local release
+    if scheme == "gh" then
+        release = github_release_for(user, name, nil)
+        if not release then
+            return nil, "no GitHub release found for " .. user .. "/" .. name
+        end
+    else
+        release = gitlab_release_for(user, name, nil)
+        if not release then
+            return nil, "no GitLab release found for " .. user .. "/" .. name
+        end
+    end
+    local version = release.tag_name or release.name
+    if not version or version == "" then
+        return nil, "release metadata has no version"
+    end
+    return tostring(version)
+end
+
+function klua.commands.outdated(args)
+    local targets, status = {}, 0
+    if #args > 0 then
+        for _, arg in ipairs(args) do
+            if string.find(arg, ":", 1, true) then
+                targets[#targets + 1] = strip_target_tag(arg)
+            else
+                local resolved, err, candidates = resolve_alias(arg)
+                if not resolved then
+                    local suggestion = closest_match(arg, candidates or {})
+                    if suggestion then
+                        klua.warn("did you mean '" .. suggestion .. "'?")
+                    end
+                    klua.error(err)
+                    status = 1
+                else
+                    targets[#targets + 1] = strip_target_tag(resolved)
+                end
+            end
+        end
+    else
+        local seen = {}
+        for _, package in ipairs(installed_packages()) do
+            if (package.provider == "gh" or package.provider == "gl")
+                and not seen[package.target] then
+                seen[package.target] = true
+                targets[#targets + 1] = package.target
+            end
+        end
+        if #targets == 0 then
+            klua.info("outdated: no installed gh/gl packages to check")
+            return 0
+        end
+    end
+
+    local found = 0
+    for _, target in ipairs(targets) do
+        local installed = current_version(target)
+        if not installed then
+            klua.warn("outdated: " .. target .. " is not installed")
+        else
+            local latest, err = latest_release_version(target)
+            if not latest then
+                klua.warn("outdated: could not check " .. target .. ": " .. err)
+                status = 1
+            elseif latest ~= installed and natural_version_less(installed, latest) then
+                found = found + 1
+                klua.info("outdated: " .. target .. " " .. installed .. " -> " .. latest)
+            end
+        end
+    end
+
+    if status == 0 then
+        if found > 0 then
+            klua.info("outdated: " .. found .. " package(s) can be upgraded")
+        else
+            klua.info("outdated: all checked packages are up to date")
+        end
+    end
     return status
 end
 

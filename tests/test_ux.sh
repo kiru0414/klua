@@ -94,7 +94,8 @@ printf 'klua.registries = { "http://127.0.0.1:%s" }\n' "$PORT" \
     > "$SANDBOX/.config/klua/init.lua"
 
 TOOL_URL="http://127.0.0.1:$PORT/files/tool"
-STORE_TOOL="$SANDBOX/.local/share/klua/store/url/127.0.0.1:$PORT/tool/direct"
+TOOL_HASH="$(printf '%s' "$TOOL_URL" | sha256sum | cut -c1-12)"
+STORE_TOOL="$SANDBOX/.local/share/klua/store/url/127.0.0.1:$PORT/tool-$TOOL_HASH/direct"
 PACKAGES="$SANDBOX/.config/klua/packages.yaml"
 
 # --- CLI typo suggestions ---------------------------------------------------

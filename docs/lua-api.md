@@ -41,16 +41,16 @@ primitives below.
 
 | Name | Type | Meaning |
 | ---- | ---- | ------- |
-| `klua.version` | string | klua version, e.g. `"0.7.0"` |
+| `klua.version` | string | klua version, e.g. `"0.8.0"` |
 | `klua.paths` | table | `config`, `store`, `bin`, `cache`, `shards`, `init`, `packages`, `lock`, `taps` (absolute path strings) |
 | `klua.providers` | table | scheme -> `function(rest, target)` |
 | `klua.commands` | table | command name -> `function(args)` returning an exit code |
 | `klua.install_opts` | table | install-time flags: `force` (override link guards), `link` (`false` = store-only install), `as` (primary link name from `--as`) |
 | `klua.registries` | array | registry base URLs for alias sharding (defaults to the official registry) |
 | `klua.shard_ttl` | number | registry shard cache lifetime in seconds (default `3600`); `0` disables reuse |
-| `klua.cli_flags` | table | `no_cache`, `skip_checksum`, `locked`, `lock`, published from CLI switches before dispatch |
+| `klua.cli_flags` | table | `no_cache`, `skip_checksum`, `locked`, `lock`, `yes`, `latest`, `upgrade`, `dry_run`, published from CLI switches before dispatch |
 | `klua.system` | table | system package delegation overrides: `manager`, `status`, `install` |
-| `klua.lockfile` | table | parsed `packages.lock.yaml` state (`entries`, `loaded`) and lock helpers |
+| `klua.lockfile` | table | parsed `packages.lock.yaml` state (`entries`, `loaded`) and helpers, including `prune` |
 | `klua.verify` | table | optional signature hooks: `command`, `hook` |
 
 ### Service endpoint overrides
@@ -117,6 +117,21 @@ Runs the string through the system shell (`/bin/sh -c`); returns the
 normalized exit code (0 = success). Quote untrusted values yourself
 (single-quote wrapping with `'\\''` escaping, as the baseline does).
 
+```lua
+local approved = klua.confirm("execute these remote commands? [y/N] ")
+```
+
+`klua.confirm(prompt)` prints the prompt, reads one line from stdin and returns
+`true` only for `y` or `yes`. EOF/non-interactive input is a denial, which is
+why scripts use `--yes` / `-y`. The baseline publishes that flag as
+`klua.cli_flags.yes` and uses `klua.confirm` before executing remote
+`build.steps` or `verify:` commands.
+
+`klua.cli_flags.dry_run` is true for `sync --dry-run` / `upgrade --dry-run`.
+The baseline branches on it to print `dry-run: ...` notices instead of
+downloading, linking, executing `sys:` commands or writing the lockfile.
+Custom handlers should honor the same flag when adding mutating actions.
+
 ## HTTP
 
 ```lua
@@ -173,9 +188,13 @@ end
 ```lua
 local digest, err = klua.sha256("/path/to/archive.tar.gz")
 -- digest: lowercase 64-character hex on success; "" plus err on failure
+
+local url_digest = klua.sha256_text("https://host/dir/tool.tar.gz")
+-- digest of an in-memory string; the baseline uses its first 12 characters
+-- in url: store paths such as store/url/host/tool-<hash>/direct
 ```
 
-Implemented with OpenSSL `EVP_Digest`. The baseline calls it on the
+Both helpers use OpenSSL `EVP_Digest`. The baseline calls `sha256` on the
 downloaded payload before extraction when the release contains
 `<asset>.sha256`, `<asset>.sha256sum` or `checksums.txt`. It accepts
 `<hash>  <filename>`, `<hash> *<filename>`, BSD-style
@@ -251,6 +270,7 @@ local entry = klua.lockfile.get(target, provider) -- nil, true on a locked-targe
 klua.lockfile.record(target, provider, version, asset, url, sha256) -- only with --lock
 local code = klua.lockfile.verify(payload, asset, entry, "my:provider")
 klua.lockfile.save()                            -- writes the file only with --lock
+klua.lockfile.prune({ ["gh:user/removed"] = true }) -- drop entries on remove
 ```
 
 Custom providers that want lock support should call `get()` before network
@@ -261,6 +281,12 @@ mutually exclusive with `--lock` and `--skip-checksum`; `sys:` and custom
 non-release schemes are not locked. `verify()` always re-hashes the payload on
 a locked run and aborts on mismatch — TOFU is strict even if the lockfile was
 written earlier and the upstream asset has since changed.
+
+`prune(removed)` takes a set of canonical target keys and deletes matching
+lock entries. The built-in `remove` handler calls it after a successful
+removal, even when `--lock` is not set, and reports
+`lockfile pruned: N entry/entries removed` when anything was dropped.
+With `--dry-run` it emits a preview instead of rewriting the file.
 
 ## Signature verification
 
@@ -273,8 +299,10 @@ path is appended automatically when the template contains no file placeholder.
 `klua.verify.hook(context)` may also inspect the same fields and return
 `false`, a non-zero number, or raise an error to reject the payload.
 Verification fails closed: a missing tool, a non-zero command, or a rejecting
-hook aborts the install. Set `verify: false` in a manifest to disable hooks
-for that package.
+hook aborts the install. Commands defined in a **remote** `klua.yaml` are
+printed and require interactive approval or `--yes` / `-y` before running;
+`init.lua` commands are trusted. Set `verify: false` in a manifest to disable
+hooks for that package.
 
 ```lua
 klua.verify = {
@@ -346,11 +374,14 @@ caught and reported; the install fails with exit 1.
 
 The CLI dispatches `klua.commands.<name>(args)` where `args` is an array
 of positional strings. Names: `install`, `run`, `search`, `info`, `cleanup`,
-`doctor`, `add`, `remove`, `sync`, `upgrade`, `tap`, `list`, `init-manifest`
-(note the dash: `klua.commands["init-manifest"]`). `run` receives the target
-plus all pass-through arguments. CLI-wide switches (`--no-cache`,
-`--skip-checksum`, `--lock`, `--locked`) are consumed by CLI11 and exposed as
-`klua.cli_flags`; they are not passed in `args`. Return a process exit code.
+`doctor`, `add`, `remove`, `sync`, `upgrade`, `outdated`, `tap`, `list`,
+`init-manifest` (note the dash: `klua.commands["init-manifest"]`). `run`
+receives the target plus all pass-through arguments. CLI-wide switches
+(`--no-cache`, `--skip-checksum`, `--lock`, `--locked`, `--yes`, `--latest`,
+`--upgrade`, `--dry-run`) are exposed as `klua.cli_flags`; they are not passed
+in `args`. Because `run` is a CLI11 prefix command, klua flags must appear
+before the target; the baseline consumes them there and forwards everything
+after the target to the package binary. Return a process exit code.
 Override or wrap freely:
 
 ```lua
@@ -402,7 +433,10 @@ library, occupancy, protected-command and PATH guards described above.
 directories prepended to `PATH` and store library directories prepended to
 `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`; it uses `klua.is_dir` to discover
 library directories up to two levels deep and `shq()`-style single-quote
-escaping for every argument. Custom providers that create links themselves
+escaping for every argument. With `klua.cli_flags.upgrade` or
+`klua.cli_flags.latest`, the baseline strips a pinned `@tag`, forces a fresh
+store-only install of the newest release, and runs that binary. Custom
+providers that create links themselves
 should respect `klua.install_opts.link` and perform equivalent conflict
 checks using `klua.readlink`, `klua.is_executable` and `klua.env("PATH")`.
 
@@ -419,8 +453,9 @@ is implemented natively so it works even when Lua is broken:
   unified diff of the pending change and touches no files.
 
 Typo suggestions are Levenshtein-based for the new command names (`run`,
-`search`, `info`, `cleanup`, `doctor`, `remove`/`rm`/`uninstall`) and flags
-(`--force`, `--as`, `--no-cache`, `--skip-checksum`, `--dry-run`, `--diff`).
+`search`, `info`, `cleanup`, `doctor`, `outdated`, `remove`/`rm`/`uninstall`)
+and flags (`--force`, `--as`, `--no-cache`, `--skip-checksum`, `--dry-run`,
+`--diff`, `--yes`, `-y`, `--latest`, `--upgrade`).
 
 ## Recipes
 

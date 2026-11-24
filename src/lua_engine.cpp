@@ -9,6 +9,7 @@
 #include "serialize.hpp"
 #include "sys.hpp"
 
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -284,6 +285,39 @@ void LuaEngine::bind_natives() {
                        return {digest, sol::nullopt};
                    });
 
+    // SHA-256 of an in-memory string. URL store paths use a short prefix of
+    // this digest so two different URLs with the same file name never share
+    // a store directory.
+    k.set_function("sha256_text", [](const std::string& text) {
+        return crypto::sha256_text(text);
+    });
+
+    // Explicit approval for shell commands coming from a remote klua.yaml.
+    // Only y/yes counts; EOF (non-interactive stdin) is a denial so CI must
+    // pass --yes / -y. The prompt is written to stdout before reading.
+    k.set_function("confirm", [](const std::string& prompt) {
+        std::cout << prompt << std::flush;
+        std::string answer;
+        if (!std::getline(std::cin, answer)) {
+            return false;
+        }
+        while (!answer.empty()
+               && (answer.back() == '\r' || answer.back() == ' ' || answer.back() == '\t')) {
+            answer.pop_back();
+        }
+        std::size_t start = 0;
+        while (start < answer.size()
+               && (answer[start] == ' ' || answer[start] == '\t')) {
+            ++start;
+        }
+        answer = answer.substr(start);
+        for (char& character : answer) {
+            character = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(character)));
+        }
+        return answer == "y" || answer == "yes";
+    });
+
     // Archive extraction with single-top-level-directory stripping.
     k.set_function("extract",
                    [](const std::string& archive_path, const std::string& dest_dir)
@@ -462,12 +496,16 @@ int LuaEngine::run_command(const std::string& name, const std::vector<std::strin
     return 0;
 }
 
-void LuaEngine::set_cli_flags(bool no_cache, bool skip_checksum, bool locked, bool lock) {
-    sol::table flags = lua_["klua"]["cli_flags"].get_or_create<sol::table>();
-    flags["no_cache"] = no_cache;
-    flags["skip_checksum"] = skip_checksum;
-    flags["locked"] = locked;
-    flags["lock"] = lock;
+void LuaEngine::set_cli_flags(const CliFlags& flags) {
+    sol::table table = lua_["klua"]["cli_flags"].get_or_create<sol::table>();
+    table["no_cache"] = flags.no_cache;
+    table["skip_checksum"] = flags.skip_checksum;
+    table["locked"] = flags.locked;
+    table["lock"] = flags.lock;
+    table["yes"] = flags.yes;
+    table["latest"] = flags.latest;
+    table["upgrade"] = flags.upgrade;
+    table["dry_run"] = flags.dry_run;
 }
 
 } // namespace klua

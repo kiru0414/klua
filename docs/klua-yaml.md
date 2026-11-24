@@ -45,6 +45,10 @@ comment-only, klua silently falls back to asset scoring.
   checksum verification and before extraction. Release discovery now falls
   back through `releases.atom` before the REST API, and an empty
   `expanded_assets` scrape is treated as a failure.
+- v0.8.0 requires approval to run shell commands from a remote manifest:
+  `build.steps` and `verify:` are printed before execution and denied when
+  stdin is non-interactive unless `--yes` / `-y` is passed. `sync --dry-run`
+  and `upgrade --dry-run` print the planned commands without running them.
 - Custom Lua in `init.lua` can override the provider or command handlers that
   consume manifests. `klua repair` backs up your `init.lua` to
   `init.lua.bak.<timestamp>` before restoring the baseline; preview with
@@ -102,7 +106,9 @@ verify: "cosign verify-blob --certificate {payload}.pem {payload}"
 A global `klua.verify.command` in `init.lua` applies when the manifest has no
 `verify:` field, and `klua.verify.hook(context)` can reject the payload with
 `false`, a non-zero number, or an error. Verification fails closed — a missing
-tool or a rejected hook stops the install. See
+tool or a rejected hook stops the install. Commands coming from a **remote**
+manifest must be approved interactively or with `--yes` / `-y`; global
+`init.lua` commands are trusted. See
 [lua-api.md](lua-api.md#signature-verification).
 
 ## assets
@@ -221,14 +227,16 @@ bins:
 
 Mechanics:
 
-1. `git clone --depth 1` (plus `--branch <tag>` when pinned) into
+1. Commands from a remote manifest are printed and must be approved
+   interactively or with `klua install --yes` / `-y` before anything is cloned.
+2. `git clone --depth 1` (plus `--branch <tag>` when pinned) into
    `~/.cache/klua/build/<user>-<repo>`.
-2. Each step runs as `cd <clone> && <step>` via the system shell; any
+3. Each step runs as `cd <clone> && <step>` via the system shell; any
    non-zero exit aborts the install.
-3. Produced binaries are collected: `bins` entries first; otherwise the
+4. Produced binaries are collected: `bins` entries first; otherwise the
    first non-empty of `target/release/`, `build/`, `bin/`; otherwise a
    full scan of the clone for executables.
-4. Binaries are copied into the store under version `source` (or the
+5. Binaries are copied into the store under version `source` (or the
    pinned tag), chmod'ed, and symlinked. `configs` apply as usual.
 
 The clone URL base is overridable (`klua.github_clone` / `klua.gitlab_clone`

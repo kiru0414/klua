@@ -69,6 +69,8 @@ exists() { # <name> <path-test-exit>
 # --- local registry + package server ----------------------------------------
 PORT=8127
 SRV="$SANDBOX/srv"
+RUNNER_URL="http://127.0.0.1:$PORT/files/runner.tar.gz"
+RUNNER_HASH="$(printf '%s' "$RUNNER_URL" | sha256sum | cut -c1-12)"
 mkdir -p "$SRV/v1" "$SRV/files" "$SANDBOX/pkgs"
 
 # Build a package archive from a script name and optional extra files.
@@ -116,7 +118,7 @@ cat > "$SRV/v1/t.yaml" <<EOF
 tool: url:http://127.0.0.1:$PORT/files/tool.tar.gz
 EOF
 cat > "$SRV/v1/r.yaml" <<EOF
-runner: url:http://127.0.0.1:$PORT/files/runner.tar.gz
+runner: url:$RUNNER_URL
 EOF
 cat > "$SRV/v1/s.yaml" <<EOF
 spacer: url:http://127.0.0.1:$PORT/files/spacer.tar.gz
@@ -154,7 +156,7 @@ export PATH="$HOME/.local/bin:$FAKEBIN:$PATH"
 # --- version -----------------------------------------------------------------
 run --version
 check "--version exits 0" 0 $?
-expect_output "version is 0.7.0" "klua 0.7.0"
+expect_output "version is 0.8.0" "klua 0.8.0"
 
 # --- CLI typo suggestions include new commands --------------------------------
 run serach tool
@@ -206,7 +208,7 @@ run run runner hello world
 check "run installs and executes" 0 $?
 expect_output "run installs without linking" "store only, no links"
 expect_output "run executes the binary" "runner-ok"
-expect_output "run exposes store libraries" "runner/direct/lib"
+expect_output "run exposes hashed store libraries" "runner-$RUNNER_HASH/direct/lib"
 expect_output "run forwards arguments" "args=hello world"
 [ ! -L "$HOME/.local/bin/runner" ]
 exists "run leaves ~/.local/bin untouched" $?
@@ -214,7 +216,7 @@ exists "run leaves ~/.local/bin untouched" $?
 run run runner --version
 check "run forwards flags after target" 0 $?
 expect_output "flag passed through" "args=--version"
-expect_absent "flag not swallowed by klua" "klua 0.7.0"
+expect_absent "flag not swallowed by klua" "klua 0.8.0"
 
 run run runner again
 check "run on installed package exits 0" 0 $?
@@ -287,7 +289,7 @@ exists "download cache cleared" $?
 # --- doctor ---------------------------------------------------------------------
 run doctor
 check "doctor exits 0 with only warnings" 0 $?
-expect_output "doctor reports version" "klua 0.7.0"
+expect_output "doctor reports version" "klua 0.8.0"
 expect_output "doctor checks store" "\[ok\]   store:"
 expect_output "doctor checks registry" "registry: http://127.0.0.1:$PORT"
 expect_output "doctor summary" "doctor:"

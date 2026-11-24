@@ -326,7 +326,7 @@ export PATH="$HOME/.local/bin:$PATH"
 # --- version and API surface -------------------------------------------------
 run --version
 check "--version exits 0" 0 $?
-expect_output "version is 0.7.0" "klua 0.7.0"
+expect_output "version is 0.8.0" "klua 0.8.0"
 
 # --- parallel shard fetching (bounded worker pool) ---------------------------
 rm -f "$PEAK"
@@ -367,7 +367,7 @@ expect_output "sync downloads in parallel" "batch: downloading 2 asset(s) in par
 peak_at_least "two archives downloaded concurrently" 2
 
 # --- verification hook: success ---------------------------------------------
-run install gh:acme/verifyok
+run install --yes gh:acme/verifyok
 check "verify success install exits 0" 0 $?
 expect_output "verify command executed" "verify: test -s"
 expect_output "verify success accepted" "verify: signature accepted"
@@ -375,7 +375,7 @@ expect_output "verify success accepted" "verify: signature accepted"
 exists "verified package linked" $?
 
 # --- verification hook: failure closes the install --------------------------
-run install gh:acme/verifybad
+run install --yes gh:acme/verifybad
 check "verify failure exits nonzero" 1 $?
 expect_output "verify failure reported" "verify command failed (exit 1)"
 [ ! -e "$HOME/.local/bin/verifybad" ]

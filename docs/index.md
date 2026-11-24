@@ -37,6 +37,13 @@ your `init.lua` can evolve every provider or command without recompiling.
   changed upstream payload aborts even when the lockfile itself is untouched.
   An optional `verify:` command hook can run `cosign verify-blob`, `gpg
   --verify`, or any host tool before extraction.
+- **Explicit remote-command approval.** Shell commands supplied by a remote
+  `klua.yaml` (`build.steps` and `verify:`) are never run silently. Pass
+  `--yes` / `-y` for automation, or confirm the printed commands interactively;
+  EOF/non-interactive stdin is treated as a denial.
+- **Reversible previews.** `sync --dry-run` and `upgrade --dry-run` print the
+  packages, version changes and system commands they would use without
+  downloading, linking or writing the lockfile.
 - **Reproducible installs.** `sync --lock` records versions, asset URLs and
   digests; `sync --locked` reproduces them without release discovery and fails
   on any mismatch.
@@ -52,7 +59,8 @@ your `init.lua` can evolve every provider or command without recompiling.
 
 Milestones 1, 2 and 3 plus the v0.4.0 safety release, the v0.5.0
 resolution/verification release, the v0.6.0 delegation/reproducibility
-release and the v0.7.0 performance/resilience release are implemented:
+release, the v0.7.0 performance/resilience release and the v0.8.0 safety and
+preview release are implemented:
 
 **Milestone 1 — core skeleton**
 
@@ -198,6 +206,29 @@ release and the v0.7.0 performance/resilience release are implemented:
   template; a Lua `klua.verify.hook(context)` may inspect or reject the payload
   directly. Verification fails closed.
 
+**v0.8.0 — explicit approval, previews & drift reporting**
+
+- `install`, `remove`, `run`, `sync` and `upgrade` accept `--yes` / `-y`.
+  Remote `klua.yaml` `build.steps` and manifest `verify:` commands are printed
+  and must be approved interactively or with this flag; a denial fails the
+  install before any clone, build step or verification command runs.
+- `remove` prunes matching `packages.lock.yaml` entries even without `--lock`,
+  so a later `sync --locked` cannot resurrect a package you deliberately
+  removed. The baseline also exposes `klua.lockfile.prune(removed)` for custom
+  command handlers.
+- `run --upgrade` (alias `run --latest`) ignores a pinned `@tag`, stages the
+  newest release store-only, and then executes it. Flags after the target are
+  still forwarded to the package binary, not consumed by klua.
+- `url:` store paths are keyed by a 12-character SHA-256 prefix of the full
+  canonical URL: `store/url/<host>/<stem>-<url-hash>/direct`. Different URLs
+  with the same host and filename no longer collide in `info`, `remove` or
+  `klua run`.
+- `klua outdated [targets...]` compares installed `gh:` / `gl:` versions with
+  the newest release and lists available upgrades.
+- `sync --dry-run` and `upgrade --dry-run` preview actions, version changes and
+  generated `sys:` commands without changing the store, links or lockfile.
+  `--dry-run` cannot be combined with `--lock`.
+
 See `AGENTS.md` for the full roadmap.
 
 ## Testing
@@ -211,6 +242,7 @@ bash tests/test_v04.sh          # offline: conflict safety, run, management, rep
 bash tests/test_v05.sh          # offline: API-free GitHub, shard cache, SHA-256
 bash tests/test_v06.sh          # offline: sys batching, tokens, lockfiles
 bash tests/test_v07.sh          # offline: parallel batches, 3-tier fallback, TOFU, verify
+bash tests/test_v08.sh          # offline: approvals, pruning, run refresh, outdated, dry-run
 ```
 
 ## Building (Linux / macOS)
@@ -242,11 +274,16 @@ klua install --force git      # override shadowing/protected-command guard
 klua install --as jq2 jq      # link the primary binary as ~/.local/bin/jq2
 klua install --no-cache fd    # refetch the registry shard instead of using cache
 klua install --skip-checksum jq  # bypass SHA-256 verification (explicit)
+klua install --yes gh:user/repo  # approve remote build.steps / verify commands
 klua install sys:git,curl     # skip installed packages; batch the rest
 klua sync --lock              # write versions, URLs and digests to the lockfile
 klua sync --locked            # reproduce exactly; abort on any hash mismatch
+klua sync --dry-run           # preview packages and sys commands; change nothing
 klua install --locked gh:jqlang/jq  # TOFU: verify against the locked digest
 klua run jq --version         # execute from the store, no global symlink
+klua run --upgrade jq         # stage the newest release, then run it
+klua run --latest gh:user/repo # alias for --upgrade
+klua outdated                 # list installed gh/gl packages with newer releases
 klua search jq                # search alias shards across all registries
 klua info jq                  # resolution, versions, links, release metadata
 klua cleanup                  # prune old versions, broken links and caches
@@ -254,8 +291,9 @@ klua doctor                   # diagnose dirs, PATH, registries, links
 klua add gh:jqlang/jq fd      # record targets in packages.yaml
 klua sync                     # install everything in packages.yaml
 klua sync https://host/dotfiles.yaml  # remote source, follows includes:
+klua upgrade --dry-run        # preview version changes and sys commands
 klua upgrade                  # upgrade all installed packages
-klua remove fd                # delete symlinks, store dir, packages.yaml entry
+klua remove fd                # delete links, store dir, packages.yaml + lock entries
 klua rm gh:jqlang/jq          # alias of remove
 klua uninstall url:https://host/tool.tar.gz  # alias of remove
 klua list                     # installed packages from the store
@@ -270,8 +308,12 @@ klua repair --dry-run         # preview backup path and diff, change nothing
 | ------- | ----------------------------------------------- |
 | Config  | `~/.config/klua/` (`init.lua`, `packages.yaml`, `packages.lock.yaml`, `taps.yaml`) |
 | Store   | `~/.local/share/klua/store/<provider>/<user>/<repo>/<version>/` |
+| URL store | `~/.local/share/klua/store/url/<host>/<stem>-<url-hash>/direct/` |
 | Bin     | `~/.local/bin/` (symlinks into the store)       |
 | Cache   | `~/.cache/klua/` (`downloads/`, `checksums/`, `build/`, `shards/`) |
+
+The `<url-hash>` is the first 12 hex characters of the SHA-256 of the full
+canonical download URL, so same-named files from different paths stay isolated.
 
 Libraries are never linked into `~/.local/bin/`; they stay inside the store
 and are exposed to `klua run` via `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`.
@@ -293,15 +335,17 @@ end)
 Native primitives available to Lua: `klua.info/warn/error`,
 `klua.file_exists/is_dir/is_executable/read_file/write_file/mkdir/copy/remove/list_dir`,
 `klua.find_executables`, `klua.readlink`, `klua.env`, `klua.exec`,
-`klua.register_provider`,
+`klua.confirm`, `klua.register_provider`,
 `klua.http_get/http_get_batch/http_head_redirect/download/download_batch`,
-`klua.sha256`, `klua.extract/is_archive`, `klua.symlink`, `klua.chmod_exec`,
-`klua.json_parse/yaml_parse`, `klua.platform`, `klua.paths`, `klua.version`.
+`klua.sha256/sha256_text`, `klua.extract/is_archive`, `klua.symlink`,
+`klua.chmod_exec`, `klua.json_parse/yaml_parse`, `klua.platform`, `klua.paths`,
+`klua.version`.
 Set `klua.shard_ttl` to change the one-hour cache lifetime and
-`klua.cli_flags` to inspect `--no-cache`, `--skip-checksum`, `--lock` and
-`--locked` from your own handlers. `klua.system` can override system-package
-detection/status/installation, and `klua.lockfile` exposes the parsed lock
-entries. Set `klua.install_opts =
+`klua.cli_flags` to inspect `--no-cache`, `--skip-checksum`, `--lock`,
+`--locked`, `--yes`, `--latest`, `--upgrade` and `--dry-run` from your own
+handlers. `klua.system` can override system-package detection/status/installation,
+and `klua.lockfile` exposes the parsed lock entries plus
+`require/get/record/verify/save/prune` helpers. Set `klua.install_opts =
 { force = ..., link = ..., as = ... }` in a custom handler to control conflict
 overrides, rename the primary link, or request a store-only (run-only)
 install. This is the "self-evolving" part: rebind `klua.commands.<name>` or

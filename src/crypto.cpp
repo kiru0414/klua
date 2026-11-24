@@ -42,4 +42,22 @@ std::string sha256_file(const std::string& path, std::string& error) {
     return result;
 }
 
+std::string sha256_text(const std::string& text) {
+    unsigned char digest[EVP_MAX_MD_SIZE]{};
+    unsigned int length = 0;
+    if (EVP_Digest(text.data(), text.size(), digest, &length, EVP_sha256(), nullptr)
+        != 1) {
+        return {};
+    }
+
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(length * 2);
+    for (unsigned int i = 0; i < length; ++i) {
+        result.push_back(hex[digest[i] >> 4]);
+        result.push_back(hex[digest[i] & 0x0f]);
+    }
+    return result;
+}
+
 } // namespace klua::crypto

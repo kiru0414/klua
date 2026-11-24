@@ -291,10 +291,11 @@ void suggest_cli_typos(int argc, char** argv) {
     const std::vector<std::string> commands = {
         "install", "i", "add", "sync", "upgrade", "repair", "tap", "list",
         "init-manifest", "remove", "rm", "uninstall", "run", "search", "info",
-        "cleanup", "doctor"};
+        "cleanup", "doctor", "outdated"};
     const std::vector<std::string> flags = {"--help", "-h", "--version", "--force",
                                             "--as", "--no-cache", "--skip-checksum",
-                                            "--locked", "--lock", "--dry-run", "--diff"};
+                                            "--locked", "--lock", "--dry-run", "--diff",
+                                            "--yes", "-y", "--latest", "--upgrade"};
 
     for (int index = 1; index < argc; ++index) {
         const std::string token = argv[index];
@@ -331,6 +332,7 @@ struct CommandArgs {
     std::vector<std::string> remove_targets;
     std::string sync_source;
     std::vector<std::string> upgrade_targets;
+    std::vector<std::string> outdated_targets;
     std::string tap_action;
     std::string tap_url;
     std::string search_query;
@@ -350,6 +352,10 @@ int main(int argc, char** argv) {
     bool skip_checksum = false;
     bool locked = false;
     bool lock = false;
+    bool assume_yes = false;
+    bool run_latest = false;
+    bool run_upgrade = false;
+    bool dry_run = false;
     auto add_fetch_flags = [&](CLI::App* command) {
         command->add_flag("--no-cache", no_cache,
                           "Bypass registry shard cache and refetch");
@@ -361,6 +367,10 @@ int main(int argc, char** argv) {
                           "Require and reproduce packages.lock.yaml exactly");
         command->add_flag("--lock", lock,
                           "Write resolved versions, URLs and SHA-256 hashes to the lockfile");
+    };
+    auto add_yes_flag = [&](CLI::App* command) {
+        command->add_flag("--yes,-y", assume_yes,
+                          "Approve shell commands supplied by a remote klua.yaml");
     };
 
     bool install_force = false;
@@ -374,6 +384,7 @@ int main(int argc, char** argv) {
                         "Link the primary binary under this name instead of its own");
     add_fetch_flags(install);
     add_lock_flags(install);
+    add_yes_flag(install);
 
     auto* add = app.add_subcommand("add", "Record targets in packages.yaml without installing");
     add->add_option("targets", args.add_targets, "Targets to record")->required();
@@ -383,12 +394,18 @@ int main(int argc, char** argv) {
                         ->alias("uninstall");
     remove->add_option("targets", args.remove_targets, "Packages to remove")->required();
     add_fetch_flags(remove);
+    add_yes_flag(remove);
 
     // `run` is a prefix command: everything after the package target is passed
     // through unchanged to the executed binary (flags included).
     auto* run = app.add_subcommand("run", "Run a package binary from the store without linking it");
     run->prefix_command();
+    run->add_flag("--upgrade", run_upgrade,
+                  "Refresh the package to the latest release before running");
+    run->add_flag("--latest", run_latest,
+                  "Alias for --upgrade");
     add_fetch_flags(run);
+    add_yes_flag(run);
 
     auto* search = app.add_subcommand("search", "Search aliases across configured registries");
     search->add_option("query", args.search_query, "Substring to match in aliases or targets")->required();
@@ -407,11 +424,23 @@ int main(int argc, char** argv) {
     sync->add_option("source", args.sync_source, "Local path or URL of the YAML source");
     add_fetch_flags(sync);
     add_lock_flags(sync);
+    add_yes_flag(sync);
+    sync->add_flag("--dry-run", dry_run,
+                   "Preview actions without downloading, linking or writing the lockfile");
 
     auto* upgrade = app.add_subcommand("upgrade", "Upgrade installed packages");
     upgrade->add_option("targets", args.upgrade_targets, "Packages to upgrade (default: all)");
     add_fetch_flags(upgrade);
     add_lock_flags(upgrade);
+    add_yes_flag(upgrade);
+    upgrade->add_flag("--dry-run", dry_run,
+                      "Preview versions and system commands without changing state");
+
+    auto* outdated = app.add_subcommand(
+        "outdated", "List installed packages with newer releases available");
+    outdated->add_option("targets", args.outdated_targets,
+                         "Targets to check (default: all installed gh/gl packages)");
+    add_fetch_flags(outdated);
 
     bool repair_dry_run = false;
     auto* repair = app.add_subcommand("repair", "Restore ~/.config/klua/init.lua from the built-in defaults (backs up the old file)");
@@ -451,6 +480,10 @@ int main(int argc, char** argv) {
         std::cerr << "error: --skip-checksum cannot be combined with --locked\n";
         return 1;
     }
+    if (dry_run && lock) {
+        std::cerr << "error: --dry-run cannot be combined with --lock\n";
+        return 1;
+    }
 
     // Repair never touches Lua: it must succeed even with a broken engine.
     if (repair->parsed()) {
@@ -483,7 +516,8 @@ int main(int argc, char** argv) {
 
     // Publish CLI-wide switches after the self-healing startup sequence so a
     // reset engine still sees them.
-    engine.set_cli_flags(no_cache, skip_checksum, locked, lock);
+    engine.set_cli_flags(klua::CliFlags{no_cache, skip_checksum, locked, lock,
+                                        assume_yes, run_latest, run_upgrade, dry_run});
 
     // Dispatch the parsed subcommand into the Lua layer.
     if (run->parsed()) {
@@ -529,6 +563,9 @@ int main(int argc, char** argv) {
     }
     if (upgrade->parsed()) {
         return engine.run_command("upgrade", args.upgrade_targets);
+    }
+    if (outdated->parsed()) {
+        return engine.run_command("outdated", args.outdated_targets);
     }
     if (tap->parsed()) {
         std::vector<std::string> tap_args{args.tap_action};

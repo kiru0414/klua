@@ -7,6 +7,19 @@
 
 namespace klua {
 
+// CLI-wide switches published to the Lua layer after bootstrap. Grouping them
+// keeps the binding stable as commands gain new flags.
+struct CliFlags {
+    bool no_cache = false;
+    bool skip_checksum = false;
+    bool locked = false;
+    bool lock = false;
+    bool yes = false;       // --yes / -y: approve remote commands
+    bool latest = false;    // --latest: run the newest release
+    bool upgrade = false;   // --upgrade: refresh before running
+    bool dry_run = false;   // --dry-run: preview without writing state
+};
+
 // Owns the Lua 5.4 state and implements the self-healing startup sequence:
 //
 //   1. bootstrap()       -- bind native primitives, run the embedded baseline.
@@ -36,7 +49,7 @@ public:
 
     // Publish CLI-wide switches to the Lua layer after bootstrap, so command
     // handlers can honour cache, checksum and lockfile policy.
-    void set_cli_flags(bool no_cache, bool skip_checksum, bool locked, bool lock);
+    void set_cli_flags(const CliFlags& flags);
 
 private:
     void bind_natives();

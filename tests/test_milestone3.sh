@@ -222,7 +222,7 @@ check "manifest config installed" 0 $?
 [ -f "$HOME/.local/share/klua/store/gh/testuser/testrepo/v1.0.0/tool" ]
 check "manifest store layout" 0 $?
 
-run install gh:testuser/buildrepo
+run install --yes gh:testuser/buildrepo
 check "build.steps install exits 0" 0 $?
 expect_output "build step executed" "build: sh ./build.sh"
 [ -L "$HOME/.local/bin/built-tool" ]
