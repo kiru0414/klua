@@ -18,13 +18,11 @@ your custom code before restoring the embedded baseline.
 Static Linux binaries (x86_64, arm64) and macOS binaries are attached to
 every `v*` release:
 
-```sh
-curl -LO https://github.com/kiru0414/klua/releases/download/v0.8.0/klua-v0.8.0-linux-x86_64.tar.gz
-tar -xzf klua-v0.8.0-linux-x86_64.tar.gz
-install -m 755 klua ~/.local/bin/klua   # or /usr/local/bin
-klua --version
-```
+[v0.8.0](https://github.com/kiru0414/klua/releases/download/v0.8.0/klua-v0.8.0-linux-x86_64.tar.gz)
 
+```sh
+curl -fsSL https://raw.githubusercontent.com/kiru0414/klua/main/install.sh | bash
+```
 Make sure `~/.local/bin` is on your `PATH`:
 
 ```sh
