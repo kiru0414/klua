@@ -32,3 +32,4 @@ nav:
   - klua.yaml Manifest: klua-yaml.md
   - Lua API Reference: lua-api.md
   - Taps & Registry: taps-and-registry.md
+use_directory_urls: false
