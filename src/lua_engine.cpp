@@ -200,6 +200,16 @@ void LuaEngine::bind_natives() {
                        return {false, error};
                    });
 
+    // Raw symlink target (no resolution); nil when path is not a symlink.
+    k.set_function("readlink", [](const std::string& path) -> sol::optional<std::string> {
+        std::error_code ec;
+        const auto target = fs::read_symlink(fs::path{path}, ec);
+        if (ec) {
+            return sol::nullopt;
+        }
+        return target.string();
+    });
+
     k.set_function("chmod_exec",
                    [](const std::string& path)
                        -> std::tuple<bool, sol::optional<std::string>> {

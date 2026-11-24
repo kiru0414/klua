@@ -63,6 +63,8 @@ Manifests (`klua.yaml`), `sync` and `upgrade` arrive in Milestone 3. See
   cycle protection, and deduplicates entries.
 - `klua upgrade [target...]` reinstalls latest releases and reports version
   changes; without arguments it upgrades every installed gh/gl package.
+- `klua remove <target...>` (`rm`, `uninstall`) deletes `~/.local/bin`
+  symlinks, the store directory, and matching `packages.yaml` entries.
 - `klua init-manifest [--force]` generates a starter `klua.yaml`.
 - Official registry default:
   `https://raw.githubusercontent.com/kiru0414/klua-registry/main`
@@ -81,6 +83,7 @@ See `AGENTS.md` for the full roadmap.
 bash tests/test_milestone1.sh   # offline: CLI, repair, self-healing, XDG
 bash tests/test_milestone2.sh   # network: taps, alias sharding, real installs
 bash tests/test_milestone3.sh   # add/sync/upgrade + local manifest & build tests
+bash tests/test_ux.sh           # remove, CLI/alias typo suggestions
 ```
 
 ## Building (Linux / macOS)
@@ -112,6 +115,7 @@ klua add gh:jqlang/jq fd      # record targets in packages.yaml
 klua sync                     # install everything in packages.yaml
 klua sync https://host/dotfiles.yaml  # remote source, follows includes:
 klua upgrade                  # upgrade all installed packages
+klua remove fd                # delete symlinks, store dir, packages.yaml entry
 klua list                     # installed packages from the store
 klua init-manifest            # starter klua.yaml for a package repo
 klua repair                   # restore a clean ~/.config/klua/init.lua
