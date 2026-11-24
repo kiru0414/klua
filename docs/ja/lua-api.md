@@ -23,7 +23,7 @@ klua でカスタマイズできるものはすべて `~/.config/klua/init.lua` 
 
 | 名前 | 型 | 意味 |
 | ---- | ---- | ------- |
-| `klua.version` | string | klua のバージョン（例: `"0.8.0"`） |
+| `klua.version` | string | klua のバージョン（例: `"0.9.0"`） |
 | `klua.paths` | table | `config`, `store`, `bin`, `cache`, `shards`, `init`, `packages`, `lock`, `taps`（絶対パスの文字列） |
 | `klua.providers` | table | スキーム -> `function(rest, target)` |
 | `klua.commands` | table | コマンド名 -> `function(args)`（終了コードを返す） |
@@ -97,7 +97,9 @@ local approved = klua.confirm("execute these remote commands? [y/N] ")
 
 `klua.confirm(prompt)` はプロンプトを表示し、stdin から 1 行読み取り、`y` または `yes` の場合のみ `true` を返します。EOF や非対話入力は拒否とみなされるため、スクリプトでは `--yes` / `-y` を使用します。ベースラインはこのフラグを `klua.cli_flags.yes` として公開し、リモートの `build.steps` や `verify:` コマンドを実行する前に `klua.confirm` を使用します。
 
-`sync --dry-run` / `upgrade --dry-run` では `klua.cli_flags.dry_run` が true になります。ベースラインはこのフラグに基づき、ダウンロード、リンク、`sys:` コマンドの実行、ロックファイルへの書き込みの代わりに `dry-run: ...` の通知を出力します。カスタムハンドラーも、変更を伴う処理を追加する際は同じフラグを尊重すべきです。
+`klua.prompt(prompt)` はプロンプトを表示し、前後の空白を除いた回答を返します。EOF の場合は `nil` を返します。`install --select` はこれで選択したリリースの番号を読み取り、回答がない場合は選択を中止します。
+
+`install --dry-run` / `sync --dry-run` / `upgrade --dry-run` では `klua.cli_flags.dry_run` が true になります。ベースラインはこのフラグに基づき、ダウンロード、リンク、`sys:` コマンドの実行、ロックファイルへの書き込みの代わりに `dry-run: ...` の通知を出力します。カスタムハンドラーも、変更を伴う処理を追加する際は同じフラグを尊重すべきです。
 
 ## HTTP
 
@@ -132,7 +134,7 @@ end
 ```
 
 - `http_get_batch` と `download_batch` はネイティブのバッチプリミティブです。`klua search` は不足しているシャードの取得に、`klua sync` / `klua upgrade` はアーカイブの並行ダウンロードにこれらを使用します。各項目は専用の `httplib::Client` で取得され、結果は入力順に保持されます。プリフェッチに失敗した項目は、通常のプロバイダーによる再試行に任されます。
-- HTTPS は OpenSSL 経由です。`http_get` と `download` はホストをまたぐリダイレクトも追跡します。
+- HTTPS は OpenSSL 経由です。`http_get` と `download` は `301/302/303/307/308` のリダイレクトをホストをまたいで追跡し、署名付き URL のクエリ文字列も保持します。各ホップではヘッダーを作り直すため、`User-Agent: klua/<version>` は常に送信しつつ、ホスト・ポート・API パスが変わった時点で API トークンは破棄されます。これにより、GitHub のリリース CDN や S3 の署名付き URL での `HTTP 403` を回避します。
 - `http_head_redirect` はリダイレクトを**追跡せず**、生の `Location` ヘッダーを返します。ベースラインはこれを API を使わないタグ検出に使用します。
 - `User-Agent: klua/<version>` を送信します。`GITHUB_TOKEN` または `GH_TOKEN` が設定されている場合は、`api.github.com` へのリクエストに `Authorization: Bearer <token>` も付与されます。`GITLAB_TOKEN` が設定されている場合は、GitLab API へのリクエストに `PRIVATE-TOKEN` と Bearer 認証が付与されます。
 - `download` はディスクへストリーミング書き込みし、親ディレクトリを作成し、HTTP 200 のみを受け付け、失敗時には途中までのファイルを削除します。

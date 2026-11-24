@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -63,7 +64,11 @@ std::optional<Url> parse_url(const std::string& url) {
     return parsed;
 }
 
-httplib::Client make_client(const Url& url, bool follow_redirects = true) {
+// cpp-httplib's built-in redirect follower copies every request header to the
+// next host. That leaks API tokens to release CDNs and adds Authorization
+// headers to presigned S3 URLs (which answers 403). klua follows redirects
+// itself instead, so headers can be rebuilt for every hop.
+httplib::Client make_client(const Url& url) {
     std::string base = url.scheme + "://" + url.host;
     if (url.port > 0) {
         base += ":" + std::to_string(url.port);
@@ -72,7 +77,6 @@ httplib::Client make_client(const Url& url, bool follow_redirects = true) {
     client.set_connection_timeout(30, 0);
     client.set_read_timeout(300, 0);
     client.set_write_timeout(120, 0);
-    client.set_follow_location(follow_redirects);
     return client;
 }
 
@@ -136,6 +140,117 @@ httplib::Headers default_headers(const Url& url) {
     return headers;
 }
 
+// ---------------------------------------------------------------------------
+// Manual redirect handling.
+//
+// Each hop is a fresh request built from the new URL. That keeps User-Agent on
+// every hop while dropping Authorization / PRIVATE-TOKEN as soon as the host,
+// port, or API path changes. Query strings are preserved verbatim so GitHub
+// asset redirects and S3 presigned URLs keep working.
+// ---------------------------------------------------------------------------
+
+constexpr int kMaxRedirects = 10;
+
+bool is_redirect(long status) {
+    return status == 301 || status == 302 || status == 303
+        || status == 307 || status == 308;
+}
+
+bool is_retryable_status(long status) {
+    return status == 403 || status == 429 || status == 500
+        || status == 502 || status == 503 || status == 504;
+}
+
+std::string url_string(const Url& url) {
+    std::string result = url.scheme + "://" + url.host;
+    if (url.port > 0) {
+        result += ":" + std::to_string(url.port);
+    }
+    return result + url.path;
+}
+
+std::string strip_fragment(const std::string& value) {
+    const auto hash = value.find('#');
+    return hash == std::string::npos ? value : value.substr(0, hash);
+}
+
+// Collapse '.' / '..' segments without touching the raw query string.
+std::string normalize_path(std::string path) {
+    const auto query_pos = path.find('?');
+    const std::string query = query_pos == std::string::npos ? "" : path.substr(query_pos);
+    const std::string pure = query_pos == std::string::npos ? path : path.substr(0, query_pos);
+    const bool trailing_slash = !pure.empty() && pure.back() == '/';
+
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    while (start < pure.size()) {
+        const auto end = pure.find('/', start);
+        const auto stop = end == std::string::npos ? pure.size() : end;
+        const std::string part = pure.substr(start, stop - start);
+        if (!part.empty() && part != ".") {
+            if (part == "..") {
+                if (!parts.empty()) {
+                    parts.pop_back();
+                }
+            } else {
+                parts.push_back(part);
+            }
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    std::string result = "/";
+    for (std::size_t index = 0; index < parts.size(); ++index) {
+        if (index > 0) {
+            result += "/";
+        }
+        result += parts[index];
+    }
+    if (trailing_slash && result != "/") {
+        result += "/";
+    }
+    return result + query;
+}
+
+std::optional<Url> resolve_location(const Url& base, const std::string& location) {
+    const std::string value = strip_fragment(location);
+    if (value.empty()) {
+        return std::nullopt;
+    }
+
+    if (auto direct = parse_url(value)) {
+        return direct;
+    }
+    if (value.rfind("//", 0) == 0) {
+        return parse_url(base.scheme + ":" + value);
+    }
+
+    Url next = base;
+    if (value[0] == '?') {
+        const auto query = next.path.find('?');
+        const std::string path = query == std::string::npos ? next.path
+                                                          : next.path.substr(0, query);
+        next.path = path + value;
+        return next;
+    }
+    if (value[0] == '/') {
+        next.path = normalize_path(value);
+        return next;
+    }
+
+    const auto query = next.path.find('?');
+    const std::string base_path = query == std::string::npos ? next.path
+                                                            : next.path.substr(0, query);
+    const auto last_slash = base_path.rfind('/');
+    const std::string prefix = last_slash == std::string::npos
+        ? "/" : base_path.substr(0, last_slash + 1);
+    next.path = normalize_path(prefix + value);
+    return next;
+}
+
 // Run `fn(index)` for each index in [0, count) using at most eight workers.
 // Work is claimed through an atomic cursor, so slow requests do not block the
 // other workers even when the input order is uneven.
@@ -169,20 +284,51 @@ void parallel_for(std::size_t count, Fn&& fn) {
 
 Response get(const std::string& url) {
     Response response;
-    const auto parsed = parse_url(url);
-    if (!parsed) {
+    auto current = parse_url(url);
+    if (!current) {
         response.error = "invalid URL: " + url;
         return response;
     }
 
-    httplib::Client client = make_client(*parsed);
-    const auto result = client.Get(parsed->path, default_headers(*parsed));
-    if (!result) {
-        response.error = httplib::to_string(result.error());
-        return response;
+    std::set<std::string> visited;
+    for (int hop = 0; hop <= kMaxRedirects; ++hop) {
+        const std::string current_url = url_string(*current);
+        if (!visited.insert(current_url).second) {
+            response.error = "redirect loop detected at " + current_url;
+            return response;
+        }
+
+        httplib::Client client = make_client(*current);
+        const auto result = client.Get(current->path, default_headers(*current));
+        if (!result) {
+            response.error = httplib::to_string(result.error());
+            return response;
+        }
+
+        if (!is_redirect(result->status)) {
+            response.status = result->status;
+            response.body = std::move(result->body);
+            return response;
+        }
+
+        if (hop == kMaxRedirects) {
+            response.status = result->status;
+            response.error = "too many redirects for " + url;
+            return response;
+        }
+
+        const std::string location = result->get_header_value("Location");
+        const auto next = resolve_location(*current, location);
+        if (!next) {
+            response.status = result->status;
+            response.error = "invalid redirect location '" + location
+                + "' for " + current_url;
+            return response;
+        }
+        current = *next;
     }
-    response.status = result->status;
-    response.body = std::move(result->body);
+
+    response.error = "too many redirects for " + url;
     return response;
 }
 
@@ -208,7 +354,7 @@ HeadResponse head_redirect(const std::string& url) {
         return result;
     }
 
-    httplib::Client client = make_client(*parsed, /*follow_redirects=*/false);
+    httplib::Client client = make_client(*parsed);
     const auto response = client.Head(parsed->path, default_headers(*parsed));
     if (!response) {
         result.error = httplib::to_string(response.error());
@@ -239,6 +385,8 @@ bool download(const std::string& url, const std::string& dest, std::string& erro
 
     // GitHub's release-asset CDN occasionally answers transient 403/429/5xx
     // or drops the connection; retry with a short backoff before giving up.
+    // Redirects are followed manually so each hop gets fresh, host-scoped
+    // headers (see get() above).
     constexpr int max_attempts = 4;
     std::string last_error;
 
@@ -249,34 +397,78 @@ bool download(const std::string& url, const std::string& dest, std::string& erro
             return false;
         }
 
-        httplib::Client client = make_client(*parsed);
-        const auto result = client.Get(
-            parsed->path, default_headers(*parsed),
-            [&](const char* data, size_t length) {
-                out.write(data, static_cast<std::streamsize>(length));
-                return out.good();
-            },
-            nullptr);
-        out.close();
+        auto current = parsed;
+        std::set<std::string> visited;
+        long attempt_status = 0;
+        bool transport_failure = false;
+        bool fatal_redirect = false;
 
-        if (result && result->status == 200) {
-            if (!out) {
-                error = "write failed for " + dest; // local write, not retryable
-                return false;
+        for (int hop = 0; hop <= kMaxRedirects; ++hop) {
+            const std::string current_url = url_string(*current);
+            if (!visited.insert(current_url).second) {
+                last_error = "redirect loop detected at " + current_url;
+                fatal_redirect = true;
+                break;
             }
-            return true;
+
+            bool write_body = false;
+            httplib::Client client = make_client(*current);
+            const auto result = client.Get(
+                current->path, default_headers(*current),
+                [&write_body](const httplib::Response& response) {
+                    // Never stage redirect/error bodies as package payloads.
+                    write_body = response.status == 200;
+                    return true;
+                },
+                [&](const char* data, size_t length) {
+                    if (write_body) {
+                        out.write(data, static_cast<std::streamsize>(length));
+                    }
+                    return out.good();
+                },
+                nullptr);
+
+            if (!result) {
+                last_error = httplib::to_string(result.error()) + " for " + current_url;
+                transport_failure = true;
+                break;
+            }
+            attempt_status = result->status;
+
+            if (!is_redirect(attempt_status)) {
+                if (attempt_status == 200) {
+                    out.close();
+                    if (!out) {
+                        error = "write failed for " + dest; // local write, not retryable
+                        return false;
+                    }
+                    return true;
+                }
+                last_error = "HTTP " + std::to_string(attempt_status)
+                    + " for " + current_url;
+                break;
+            }
+
+            if (hop == kMaxRedirects) {
+                last_error = "too many redirects for " + url;
+                fatal_redirect = true;
+                break;
+            }
+
+            const std::string location = result->get_header_value("Location");
+            const auto next = resolve_location(*current, location);
+            if (!next) {
+                last_error = "invalid redirect location '" + location
+                    + "' for " + current_url;
+                fatal_redirect = true;
+                break;
+            }
+            current = *next;
         }
 
-        if (!result) {
-            last_error = httplib::to_string(result.error());
-        } else {
-            last_error = "HTTP " + std::to_string(result->status) + " for " + url;
-        }
-
-        const bool retryable = !result
-            || result->status == 403 || result->status == 429
-            || result->status == 500 || result->status == 502
-            || result->status == 503 || result->status == 504;
+        out.close();
+        const bool retryable = !fatal_redirect
+            && (transport_failure || is_retryable_status(attempt_status));
         if (!retryable || attempt == max_attempts) {
             break;
         }

@@ -97,6 +97,17 @@ curl -fsSL https://raw.githubusercontent.com/kiru0414/klua/main/install.sh | bas
 - `packages.lock.yaml` は trust-on-first-use のピンとして強制されます。`sync --locked` はダウンロードしたアセットを再ハッシュし、不一致があれば中止するため、上流での黙々とした改ざんを防ぎます。`--locked` は `--skip-checksum` と併用できません。
 - 任意の `verify:` コマンド（`klua.yaml` 内、または `init.lua` の `klua.verify.command`）は、チェックサム検証後、展開前に実行されます。コマンドテンプレートには `{payload}`、`{asset}`、`{version}`、`{target}`、`{sha256}` を埋め込めます。Lua の `klua.verify.hook(context)` でペイロードを直接検査・拒否することもできます。検証は fail-close（失敗時は拒否）で動作します。
 
+**v0.9.0 — バージョン選択とオフライン切り替え**
+
+- `klua install --dry-run <target>` は、解決されたパッケージ、バージョン、予定される `sys:` コマンドを整理して表示します。ストア、リンク、ロックファイルは一切変更しません。
+- Linux のシステムパッケージマネージャー（`apt`/`apt-get`、`dnf`、`yum`、`pacman`、`apk`）は、root 以外で `sudo` が利用可能な場合に自動的に `sudo` が付与されます。Homebrew（`brew`）は昇格させません。
+- HTTP ダウンロードとリリース探索は `301/302/307/308` のリダイレクトをホストをまたいで追跡します。各ホップで `User-Agent: klua/<version>` を送信し、ホストや API パスが変わると API トークンを破棄します。GitHub のリポジトリ名変更や githubusercontent の S3 URL での `HTTP 403` を解消します。
+- `@VERSION` による固定がエイリアスにも対応しました。`klua install rg@14.0.0` はエイリアスを解決してからリリースを固定します。
+- `klua versions <target>` は GitHub/GitLab API から利用可能なリリースを一覧表示し、インストール済み・有効・固定済みのバージョンを示します。API が利用できない場合はローカルのインストール済みバージョンにフォールバックします。
+- `klua install --select <target>` はリリースの番号付きメニューを表示し、選択したバージョンを固定してインストールします（TTY/stdin の回答が必要です）。
+- `klua use <target>@<version>` はインストール済みバージョンへ即座に**オフライン**でリンクを切り替えます。ダウンロード、API 呼び出し、ストアへの展開は行いません。インストール時に記録されたリンク一式を再利用し、記録がない場合は実行ファイルを検出します。
+- `klua remove <target>@<version>` はそのバージョンのみを削除し、残っている最新バージョンへ再リンクします。最後のバージョンを削除した場合は従来どおりシンボリックリンクとパッケージ／ロックのエントリを整理し、削除したバージョンの古い `--locked` 固定も解除します。
+
 **v0.8.0 — 明示的な承認、プレビュー、ドリフト報告**
 
 - `install`、`remove`、`run`、`sync`、`upgrade` は `--yes` / `-y` を受け付けます。リモートの `klua.yaml` にある `build.steps` とマニフェストの `verify:` コマンドは表示され、対話的またはこのフラグによって承認する必要があります。拒否された場合、clone、ビルド手順、検証コマンドが実行される前にインストールは失敗します。
@@ -145,6 +156,11 @@ klua tap add https://example.com/klua-registry  # register an alias registry
 klua install fd               # alias sharding -> v1/f.yaml -> gh:sharkdp/fd
 klua install gh:jqlang/jq     # direct GitHub Releases install
 klua i gh:jqlang/jq@jq-1.7.1  # pinned tag
+klua install rg@14.0.0       # pin a release through an alias
+klua install --dry-run fd    # preview resolved package, version, sys commands
+klua install --select jq     # choose a release from a numbered menu (TTY)
+klua versions jq             # list releases; mark installed/active/pinned
+klua use jq@jq-1.7.1         # offline relink to an installed version
 klua install --force git      # override shadowing/protected-command guard
 klua install --as jq2 jq      # link the primary binary as ~/.local/bin/jq2
 klua install --no-cache fd    # refetch the registry shard instead of using cache
@@ -169,6 +185,7 @@ klua sync https://host/dotfiles.yaml  # remote source, follows includes:
 klua upgrade --dry-run        # preview version changes and sys commands
 klua upgrade                  # upgrade all installed packages
 klua remove fd                # delete links, store dir, packages.yaml + lock entries
+klua remove jq@jq-1.7.1       # remove one version; relink the newest
 klua rm gh:jqlang/jq          # alias of remove
 klua uninstall url:https://host/tool.tar.gz  # alias of remove
 klua list                     # installed packages from the store

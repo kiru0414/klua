@@ -18,7 +18,7 @@ your custom code before restoring the embedded baseline.
 Static Linux binaries (x86_64, arm64) and macOS binaries are attached to
 every `v*` release:
 
-[v0.8.0](https://github.com/kiru0414/klua/releases/download/v0.8.0/klua-v0.8.0-linux-x86_64.tar.gz)
+[v0.9.0](https://github.com/kiru0414/klua/releases/download/v0.9.0/klua-v0.9.0-linux-x86_64.tar.gz)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/kiru0414/klua/main/install.sh | bash
@@ -88,7 +88,7 @@ characters of the SHA-256 of the full canonical URL, which keeps same-named
 ## CLI
 
 ```
-klua install [--force] [--as NAME] [--no-cache] [--skip-checksum] [--lock|--locked] [--yes] <target>...  (alias: klua i)
+klua install [--force] [--as NAME] [--no-cache] [--skip-checksum] [--lock|--locked] [--dry-run] [--select] [--yes] <target>...  (alias: klua i)
 klua run [--no-cache] [--skip-checksum] [--yes] [--upgrade|--latest] <target> [--] [args...]  # store-only
 klua search [--no-cache] <query>
 klua info [--no-cache] <target>
@@ -99,6 +99,8 @@ klua remove [--no-cache] [--yes] <target>...    (aliases: klua rm, klua uninstal
 klua sync [--no-cache] [--skip-checksum] [--lock|--locked] [--dry-run] [--yes] [path_or_url]
 klua upgrade [--no-cache] [--skip-checksum] [--lock] [--dry-run] [--yes] [target...]
 klua outdated [--no-cache] [target...]
+klua versions [--no-cache] <target>
+klua use <target>@<version>
 klua tap <add|remove|list> [url]
 klua list
 klua repair [--dry-run|--diff]
@@ -168,6 +170,11 @@ automatically as
 `Authorization: Bearer ...`. For a trusted custom API host, set
 `KLUA_GITHUB_API_HOST` to that hostname; the token is then limited to
 API-looking paths on that host.
+
+HTTP requests follow `301/302/307/308` redirects across hosts, sending
+`User-Agent: klua/<version>` on every hop and dropping API tokens when the
+host or API path changes. This fixes `HTTP 403` on GitHub repo renames and
+githubusercontent S3 URLs.
 
 GitLab releases use `klua.gitlab_api` directly. When `GITLAB_TOKEN` is set,
 requests to GitLab API endpoints receive both `PRIVATE-TOKEN` and
@@ -270,7 +277,9 @@ already present, and queues the rest. Every missing package from one CLI
 invocation is installed with **one** manager command (`sudo apt-get install -y
 ...` on Debian/Ubuntu, `brew install ...` on macOS, etc.) instead of spawning
 `sudo` once per package. A package listed in a manifest's
-[`depends:`](klua-yaml.md#depends) uses the same queue.
+[`depends:`](klua-yaml.md#depends) uses the same queue. When the process is not
+root and `sudo` is available, `apt`/`apt-get`, `dnf`, `yum`, `pacman` and `apk`
+commands are prefixed with `sudo` automatically; `brew` is never elevated.
 
 ```sh
 klua install sys:git,curl,wget   # one batch; already-installed packages skipped
@@ -325,9 +334,13 @@ would happen — including the exact shell command generated for any missing
 `sys:` packages — without downloading archives, changing the store, creating
 links or writing the lockfile. `upgrade --dry-run` reports planned version
 changes as `v1.0.0 -> v2.0.0`. `--dry-run` is rejected with `--lock`; use it as
-a read-only planning step before the real command.
+a read-only planning step before the real command. `install --dry-run <target>`
+uses the same read-only path for a single install: it prints the resolved
+package, its version and the planned `sys:` commands, and never modifies the
+store, links or lockfile.
 
 ```sh
+klua install --dry-run jq           # preview one install
 klua sync --dry-run                 # preview packages.yaml actions
 klua upgrade --dry-run gh:jqlang/jq # preview one upgrade
 ```
@@ -442,6 +455,28 @@ newly resolved versions. `outdated` is read-only: it compares installed
 `gh:` / `gl:` versions with the newest release and prints
 `outdated: <target> <installed> -> <latest>` for each upgrade, or
 `outdated: all checked packages are up to date`.
+
+### Version selection
+
+```sh
+klua install rg@14.0.0       # resolve the alias, then pin that release
+klua install --select jq     # numbered release menu; requires TTY/stdin
+klua versions jq             # list releases; mark installed/active/pinned
+klua use jq@jq-1.7.1         # instant OFFLINE relink to an installed version
+klua remove jq@jq-1.7.1      # remove one version, relink the newest
+```
+
+`@VERSION` pins work for bare aliases as well as scheme targets. `versions`
+lists available releases from the GitHub/GitLab API, marking installed, active
+and pinned versions; when the API is unavailable it falls back to locally
+installed versions. `--select` prints a numbered menu and installs the pinned
+version for the index you enter (a missing TTY/stdin answer cancels). `use` is
+fully offline — no download, API call or store extraction — and reuses the
+exact link set recorded at install time, falling back to executable discovery
+only when no snapshot exists. `remove` with `@version` deletes just that
+stored version and relinks the newest remaining one; removing the last version
+prunes symlinks and package/lock entries as before and drops a stale
+`--locked` pin for the removed version.
 
 ### tap / list
 

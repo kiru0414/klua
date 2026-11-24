@@ -29,9 +29,9 @@ struct DownloadResult {
     std::string error;
 };
 
-// GET a URL over HTTP(S), following redirects. Sends a klua User-Agent and,
-// for api.github.com, an Authorization: Bearer header when GITHUB_TOKEN or
-// GH_TOKEN is set.
+// GET a URL over HTTP(S). 301/302/303/307/308 redirects are followed manually:
+// each hop gets a fresh User-Agent and only the host-appropriate auth headers,
+// so tokens never leak to release CDNs or presigned S3 URLs.
 Response get(const std::string& url);
 
 // Bounded parallel GET (at most 8 workers). Results are returned in input

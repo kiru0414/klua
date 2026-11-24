@@ -94,7 +94,9 @@ std::vector<DiffLine> make_diff(const std::vector<std::string>& before,
     std::vector<DiffLine> result;
     const std::size_t n = before.size();
     const std::size_t m = after.size();
-    if (n > 4000 || m > 4000 || n * m > 4'000'000) {
+    // The product bound is enough: a tiny user init.lua against the large
+    // embedded baseline is cheap and must still show its custom lines.
+    if (n * m > 4'000'000) {
         return {};
     }
 
@@ -291,11 +293,12 @@ void suggest_cli_typos(int argc, char** argv) {
     const std::vector<std::string> commands = {
         "install", "i", "add", "sync", "upgrade", "repair", "tap", "list",
         "init-manifest", "remove", "rm", "uninstall", "run", "search", "info",
-        "cleanup", "doctor", "outdated"};
+        "cleanup", "doctor", "outdated", "versions", "use"};
     const std::vector<std::string> flags = {"--help", "-h", "--version", "--force",
                                             "--as", "--no-cache", "--skip-checksum",
                                             "--locked", "--lock", "--dry-run", "--diff",
-                                            "--yes", "-y", "--latest", "--upgrade"};
+                                            "--yes", "-y", "--latest", "--upgrade",
+                                            "--select"};
 
     for (int index = 1; index < argc; ++index) {
         const std::string token = argv[index];
@@ -337,6 +340,8 @@ struct CommandArgs {
     std::string tap_url;
     std::string search_query;
     std::string info_target;
+    std::string versions_target;
+    std::string use_target;
 };
 
 } // namespace
@@ -374,14 +379,21 @@ int main(int argc, char** argv) {
     };
 
     bool install_force = false;
+    bool install_select = false;
+    bool install_dry_run = false;
     std::string install_as;
     auto* install = app.add_subcommand("install", "Install packages (scheme targets such as gh:user/repo)")
                           ->alias("i");
-    install->add_option("targets", args.install_targets, "Targets to install")->required();
+    install->add_option("targets", args.install_targets, "Targets to install (@VERSION pins a release)")
+                      ->required();
     install->add_flag("--force", install_force,
                       "Link even when a command would shadow a system/protected binary");
     install->add_option("--as", install_as,
                         "Link the primary binary under this name instead of its own");
+    install->add_flag("--select", install_select,
+                      "Choose a release interactively before installing");
+    install->add_flag("--dry-run", install_dry_run,
+                      "Preview the resolved package, version and commands without changing state");
     add_fetch_flags(install);
     add_lock_flags(install);
     add_yes_flag(install);
@@ -414,6 +426,14 @@ int main(int argc, char** argv) {
     auto* info = app.add_subcommand("info", "Show package details (installed state, store path, release)");
     info->add_option("target", args.info_target, "Alias or scheme target")->required();
     add_fetch_flags(info);
+
+    auto* versions = app.add_subcommand("versions", "List available releases for a package (marks installed versions)");
+    versions->add_option("target", args.versions_target, "Alias or scheme target")->required();
+    add_fetch_flags(versions);
+
+    auto* use = app.add_subcommand("use", "Switch to an already-installed version by relinking its binaries offline");
+    use->add_option("target", args.use_target, "Target with @VERSION suffix, for example gh:user/repo@v1.2.3")
+        ->required();
 
     auto* cleanup = app.add_subcommand("cleanup", "Remove old store versions, broken links and caches");
 
@@ -480,8 +500,12 @@ int main(int argc, char** argv) {
         std::cerr << "error: --skip-checksum cannot be combined with --locked\n";
         return 1;
     }
-    if (dry_run && lock) {
+    if ((dry_run || install_dry_run) && lock) {
         std::cerr << "error: --dry-run cannot be combined with --lock\n";
+        return 1;
+    }
+    if (install_select && args.install_targets.size() != 1) {
+        std::cerr << "error: --select requires exactly one target\n";
         return 1;
     }
 
@@ -517,7 +541,8 @@ int main(int argc, char** argv) {
     // Publish CLI-wide switches after the self-healing startup sequence so a
     // reset engine still sees them.
     engine.set_cli_flags(klua::CliFlags{no_cache, skip_checksum, locked, lock,
-                                        assume_yes, run_latest, run_upgrade, dry_run});
+                                        assume_yes, run_latest, run_upgrade,
+                                        dry_run || install_dry_run});
 
     // Dispatch the parsed subcommand into the Lua layer.
     if (run->parsed()) {
@@ -531,6 +556,9 @@ int main(int argc, char** argv) {
         if (!install_as.empty()) {
             install_args.push_back("--as");
             install_args.push_back(install_as);
+        }
+        if (install_select) {
+            install_args.push_back("--select");
         }
         install_args.insert(install_args.end(), args.install_targets.begin(),
                             args.install_targets.end());
@@ -547,6 +575,12 @@ int main(int argc, char** argv) {
     }
     if (info->parsed()) {
         return engine.run_command("info", {args.info_target});
+    }
+    if (versions->parsed()) {
+        return engine.run_command("versions", {args.versions_target});
+    }
+    if (use->parsed()) {
+        return engine.run_command("use", {args.use_target});
     }
     if (cleanup->parsed()) {
         return engine.run_command("cleanup", {});

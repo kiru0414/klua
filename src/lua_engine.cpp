@@ -318,6 +318,30 @@ void LuaEngine::bind_natives() {
         return answer == "y" || answer == "yes";
     });
 
+    // Read one line from stdin after printing a prompt. Returns nil on EOF so
+    // interactive commands (for example `install --select`) can fail cleanly
+    // when stdin is not a terminal. Trailing CR/LF and surrounding whitespace
+    // are trimmed; callers decide what counts as a valid answer.
+    k.set_function("prompt", [](const std::string& prompt)
+                                -> sol::optional<std::string> {
+        std::cout << prompt << std::flush;
+        std::string answer;
+        if (!std::getline(std::cin, answer)) {
+            return sol::nullopt;
+        }
+        while (!answer.empty()
+               && (answer.back() == '\r' || answer.back() == '\n'
+                   || answer.back() == ' ' || answer.back() == '\t')) {
+            answer.pop_back();
+        }
+        std::size_t start = 0;
+        while (start < answer.size()
+               && (answer[start] == ' ' || answer[start] == '\t')) {
+            ++start;
+        }
+        return answer.substr(start);
+    });
+
     // Archive extraction with single-top-level-directory stripping.
     k.set_function("extract",
                    [](const std::string& archive_path, const std::string& dest_dir)

@@ -41,7 +41,7 @@ primitives below.
 
 | Name | Type | Meaning |
 | ---- | ---- | ------- |
-| `klua.version` | string | klua version, e.g. `"0.8.0"` |
+| `klua.version` | string | klua version, e.g. `"0.9.0"` |
 | `klua.paths` | table | `config`, `store`, `bin`, `cache`, `shards`, `init`, `packages`, `lock`, `taps` (absolute path strings) |
 | `klua.providers` | table | scheme -> `function(rest, target)` |
 | `klua.commands` | table | command name -> `function(args)` returning an exit code |
@@ -127,9 +127,14 @@ why scripts use `--yes` / `-y`. The baseline publishes that flag as
 `klua.cli_flags.yes` and uses `klua.confirm` before executing remote
 `build.steps` or `verify:` commands.
 
-`klua.cli_flags.dry_run` is true for `sync --dry-run` / `upgrade --dry-run`.
-The baseline branches on it to print `dry-run: ...` notices instead of
-downloading, linking, executing `sys:` commands or writing the lockfile.
+`klua.prompt(prompt)` prints the prompt and returns the trimmed answer, or
+`nil` on EOF. `install --select` uses it to read the chosen release index; a
+`nil` answer cancels the selection.
+
+`klua.cli_flags.dry_run` is true for `install --dry-run` / `sync --dry-run` /
+`upgrade --dry-run`. The baseline branches on it to print `dry-run: ...`
+notices instead of downloading, linking, executing `sys:` commands or writing
+the lockfile.
 Custom handlers should honor the same flag when adding mutating actions.
 
 ## HTTP
@@ -169,7 +174,11 @@ end
   upgrade` for concurrent archive downloads. Each item is fetched on its own
   `httplib::Client`, and results preserve input order. A failed prefetch is
   left for the normal provider to retry.
-- HTTPS via OpenSSL; `http_get` and `download` follow redirects across hosts.
+- HTTPS via OpenSSL; `http_get` and `download` follow `301/302/303/307/308`
+  redirects across hosts and preserve presigned URL query strings. Each hop
+  gets fresh headers: `User-Agent: klua/<version>` is always sent, while API
+  tokens are dropped as soon as the host, port, or API path changes. This
+  avoids `HTTP 403` from GitHub release CDNs and S3 signed URLs.
 - `http_head_redirect` does **not** follow redirects and returns the raw
   `Location` header, used by the baseline for API-free tag discovery.
 - Sends `User-Agent: klua/<version>`. Requests to `api.github.com` also send

@@ -12,6 +12,7 @@
 --   klua.read_file / klua.write_file / klua.mkdir
 --   klua.copy / klua.remove / klua.list_dir / klua.find_executables
 --   klua.readlink / klua.env / klua.exec / klua.register_provider
+--   klua.confirm / klua.prompt (interactive input, nil on EOF)
 --   klua.http_get / klua.http_head_redirect / klua.download
 --   klua.system (optional manager overrides), klua.lockfile
 --   klua.sha256 / klua.extract / klua.is_archive
@@ -76,6 +77,12 @@ local flush_system_packages
 local lock_entry_for
 local record_lock_entry
 local verify_locked_digest
+local resolve_alias
+local store_path_for
+local linked_binaries
+local package_dir_for
+local save_link_snapshot
+local resolve_target
 
 -- ---------------------------------------------------------------------------
 -- Small helpers
@@ -153,6 +160,36 @@ local function expand_home(path)
         return home .. string.sub(path, 2)
     end
     return path
+end
+
+-- Version-aware target helpers ----------------------------------------------
+-- A target can carry an explicit release pin: `gh:user/repo@v1.2.3` or
+-- `alias@v1.2.3`. Scheme targets keep the suffix in `rest` because the
+-- providers already parse it; aliases need the suffix re-attached after the
+-- registry lookup.
+
+local function split_at_tag(value)
+    if type(value) ~= "string" then
+        return value, nil
+    end
+    local name, tag = string.match(value, "^([^@]+)@(.+)$")
+    if name then
+        return name, tag
+    end
+    return value, nil
+end
+
+-- Resolve an alias that may include an @tag. Returns the full scheme target.
+local function resolve_versioned_alias(arg)
+    local name, tag = split_at_tag(arg)
+    local resolved, err, candidates = resolve_alias(name or arg)
+    if not resolved then
+        return nil, err, candidates
+    end
+    if tag then
+        resolved = resolved .. "@" .. tag
+    end
+    return resolved
 end
 
 -- v0.8.0 policy helpers -----------------------------------------------------
@@ -527,7 +564,7 @@ local function shard_entries(doc)
     return doc
 end
 
-local function resolve_alias(target)
+resolve_alias = function(target)
     local registries = all_registries()
     if #registries == 0 then
         return nil, "no registries configured for alias '" .. target
@@ -1316,6 +1353,7 @@ local function install_payload(payload_path, asset_name, store_dir, preferred_na
         return code
     end
 
+    save_link_snapshot(store_dir)
     klua.info("installed -> " .. store_dir)
     return 0
 end
@@ -1426,6 +1464,7 @@ local function build_from_source(clone_base, user, name, tag, manifest, store_di
     if code ~= 0 then
         return code
     end
+    save_link_snapshot(store_dir)
     klua.info("installed -> " .. store_dir)
     return 0
 end
@@ -2119,6 +2158,8 @@ local SYSTEM_MANAGERS = {
         install_bin = "brew",
     },
 }
+-- `apt-get:` targets and explicit manager overrides share the apt spec.
+SYSTEM_MANAGERS["apt-get"] = SYSTEM_MANAGERS.apt
 
 local system_queue = {}
 local system_seen = {}
@@ -2181,11 +2222,18 @@ local function system_package_installed(manager, pkg)
     return klua.exec(SYSTEM_MANAGERS[manager].status(pkg)) == 0
 end
 
+-- `id -u` prints the numeric UID but exits 0 for every user, so the exit code
+-- alone cannot identify root. Test the printed value instead.
+local function is_root()
+    return klua.exec("[ \"$(id -u)\" = 0 ]") == 0
+end
+
 local function sudo_prefix(manager)
+    -- Homebrew is a user-space manager and must never be wrapped in sudo.
     if manager == "brew" then
         return ""
     end
-    if klua.exec("id -u") == 0 then
+    if is_root() then
         return ""
     end
     if klua.exec("command -v sudo >/dev/null 2>&1") == 0 then
@@ -2405,9 +2453,10 @@ end
 local function install_one(target)
     local scheme, rest = string.match(target, "^([%w][%w+_-]*):(.+)$")
     if not scheme then
-        local resolved, err, candidates = resolve_alias(target)
+        local name = split_at_tag(target)
+        local resolved, err, candidates = resolve_versioned_alias(target)
         if not resolved then
-            local suggestion = closest_match(target, candidates or {})
+            local suggestion = closest_match(name or target, candidates or {})
             if suggestion then
                 klua.warn("did you mean '" .. suggestion .. "'?")
             end
@@ -2780,6 +2829,323 @@ klua.lockfile.save = save_lockfile
 klua.lockfile.prune = prune_lockfile
 
 -- ---------------------------------------------------------------------------
+-- Release listing, pinning and offline switching (v0.9.0)
+-- ---------------------------------------------------------------------------
+
+local function github_release_versions(user, name)
+    local api = klua.github_api .. "/repos/" .. user .. "/" .. name
+        .. "/releases?per_page=100"
+    local body, status, err = klua.http_get(api)
+    if err then
+        return nil, "request failed: " .. err
+    end
+    if status ~= 200 then
+        return nil, "GitHub API returned HTTP " .. tostring(status)
+    end
+    local releases, json_err = klua.json_parse(body)
+    if type(releases) ~= "table" then
+        return nil, "could not parse release JSON: " .. tostring(json_err)
+    end
+    local versions = {}
+    for _, release in ipairs(releases) do
+        if type(release) == "table" then
+            local tag = release.tag_name or release.name
+            if tag and tag ~= "" then
+                versions[#versions + 1] = tostring(tag)
+            end
+        end
+    end
+    if #versions == 0 then
+        return nil, "no releases found"
+    end
+    return versions
+end
+
+local function gitlab_release_versions(user, name)
+    local api = klua.gitlab_api .. "/projects/" .. user .. "%2F" .. name
+        .. "/releases?per_page=100"
+    local body, status, err = klua.http_get(api)
+    if err then
+        return nil, "request failed: " .. err
+    end
+    if status ~= 200 then
+        return nil, "GitLab API returned HTTP " .. tostring(status)
+    end
+    local releases, json_err = klua.json_parse(body)
+    if type(releases) ~= "table" then
+        return nil, "could not parse release JSON: " .. tostring(json_err)
+    end
+    local versions = {}
+    for _, release in ipairs(releases) do
+        if type(release) == "table" then
+            local tag = release.tag_name or release.name
+            if tag and tag ~= "" then
+                versions[#versions + 1] = tostring(tag)
+            end
+        end
+    end
+    if #versions == 0 then
+        return nil, "no releases found"
+    end
+    return versions
+end
+
+local function installed_version_set(scheme, rest)
+    local set = {}
+    local base = store_path_for(scheme, rest)
+    if not base then
+        return set
+    end
+    for _, entry in ipairs(sorted_versions(klua.list_dir(base))) do
+        set[entry.name] = true
+    end
+    return set
+end
+
+-- The active version is the one the ~/.local/bin symlinks point into. When a
+-- package has never been linked (run-only staging), fall back to the newest
+-- stored version.
+local function active_version(scheme, rest)
+    local base = store_path_for(scheme, rest)
+    if not base then
+        return nil
+    end
+    local pinned = split_at_tag(rest)
+    if pinned and klua.is_dir(normalize_dir(base) .. "/" .. pinned) then
+        return pinned
+    end
+    local entries = sorted_versions(klua.list_dir(base))
+    if #entries == 0 then
+        return nil
+    end
+    if scheme == "url" then
+        return "direct"
+    end
+    for _, name in ipairs(linked_binaries(base)) do
+        local target = klua.readlink(klua.paths.bin .. "/" .. name)
+        if target then
+            local full = normalize_dir(target)
+            for _, entry in ipairs(entries) do
+                local prefix = normalize_dir(base) .. "/" .. entry.name
+                if full == prefix or string.sub(full, 1, #prefix + 1) == prefix .. "/" then
+                    return entry.name
+                end
+            end
+        end
+    end
+    return entries[#entries].name
+end
+
+-- Collect the binaries that were linked for a given store version. The
+-- snapshot lets `use` and `remove` reproduce the exact link set offline,
+-- including manifest-declared bin names and --as overrides.
+save_link_snapshot = function(store_dir)
+    local base = normalize_dir(store_dir)
+    local lines = {}
+    for _, entry in ipairs(klua.list_dir(klua.paths.bin)) do
+        if not entry.is_dir then
+            local target = klua.readlink(entry.path)
+            if target then
+                local full = normalize_dir(target)
+                if full == base or string.sub(full, 1, #base + 1) == base .. "/" then
+                    local relative = string.sub(full, #base + 2)
+                    if relative ~= "" then
+                        lines[#lines + 1] = relative
+                    end
+                end
+            end
+        end
+    end
+    table.sort(lines)
+    klua.write_file(store_dir .. "/.klua-links", table.concat(lines, "\n") .. "\n")
+end
+
+local function clear_package_links(base)
+    for _, name in ipairs(linked_binaries(base)) do
+        local ok, err = klua.remove(klua.paths.bin .. "/" .. name)
+        if not ok then
+            return false, err
+        end
+    end
+    return true
+end
+
+local function relink_version(scheme, repo, version)
+    local base = store_path_for(scheme, repo)
+    if not base then
+        klua.error("unsupported target: " .. scheme .. ":" .. repo)
+        return 1
+    end
+    local store_dir = normalize_dir(base) .. "/" .. version
+    if scheme == "url" then
+        if version ~= "direct" then
+            klua.error("url: packages have a single version; use @direct")
+            return 1
+        end
+        store_dir = base
+    end
+    if not klua.is_dir(store_dir) then
+        klua.error("version '" .. version .. "' is not installed for " .. scheme .. ":" .. repo)
+        return 1
+    end
+
+    local ok, err = clear_package_links(base)
+    if not ok then
+        klua.error(tostring(err))
+        return 1
+    end
+
+    local saved = klua.install_opts
+    klua.install_opts = { force = true, link = true, _dependency_seen = {} }
+    local code = 0
+    local snapshot = klua.read_file(store_dir .. "/.klua-links")
+    if snapshot and snapshot ~= "" then
+        for relative in string.gmatch(snapshot, "[^\r\n]+") do
+            local target = store_dir .. "/" .. relative
+            local name = basename(relative)
+            if not klua.file_exists(target) then
+                klua.warn("saved link target is missing: " .. target)
+            elseif not safe_link(target, klua.paths.bin .. "/" .. name, name) then
+                code = 1
+            end
+        end
+    else
+        code = link_binaries(store_dir, nil, basename(repo))
+    end
+    klua.install_opts = saved
+    if code ~= 0 then
+        return code
+    end
+    klua.info("switched " .. scheme .. ":" .. repo .. " -> " .. version)
+    return 0
+end
+
+-- Return release metadata for `versions`, `install --select` and friends.
+-- Falls back to locally installed versions when the release API is offline.
+local function version_info(target, allow_remote)
+    local scheme, rest, resolved, err = resolve_target(target)
+    if not scheme then
+        return nil, err
+    end
+    local repo = split_at_tag(rest)
+    local user, name = string.match(repo, "^([^/@]+)/([^/@]+)")
+    local info = {
+        scheme = scheme,
+        rest = rest,
+        repo = repo,
+        user = user,
+        name = name,
+        target = resolved,
+        installed = installed_version_set(scheme, rest),
+        active = active_version(scheme, rest),
+        remote = false,
+    }
+    if (scheme == "gh" or scheme == "gl") and user and allow_remote ~= false then
+        local versions, version_err = scheme == "gh"
+            and github_release_versions(user, name)
+            or gitlab_release_versions(user, name)
+        if versions then
+            info.versions = versions
+            info.remote = true
+        else
+            klua.warn("could not list releases (" .. tostring(version_err)
+                .. "); showing installed versions only")
+        end
+    end
+    if not info.versions then
+        local list = {}
+        for version in pairs(info.installed) do
+            list[#list + 1] = version
+        end
+        table.sort(list, natural_version_less)
+        info.versions = list
+    end
+    return info
+end
+
+local function format_version_line(version, info, pinned)
+    local marks = {}
+    if info.installed[version] then
+        marks[#marks + 1] = "installed"
+    end
+    if info.active == version then
+        marks[#marks + 1] = "active"
+    end
+    if pinned == version then
+        marks[#marks + 1] = "pinned"
+    end
+    local suffix = #marks > 0 and ("  [" .. table.concat(marks, ", ") .. "]") or ""
+    return version .. suffix
+end
+
+local function select_version_interactively(info)
+    if type(klua.prompt) ~= "function" then
+        return nil, "interactive selection is unavailable; install with an explicit @VERSION"
+    end
+    local _, pinned = split_at_tag(info.target)
+    klua.info("available versions for " .. info.target .. ":")
+    for index, version in ipairs(info.versions) do
+        klua.info(string.format("  %2d) %s", index,
+            format_version_line(version, info, pinned)))
+    end
+    local answer = klua.prompt("select a version number [1-" .. #info.versions .. "]: ")
+    if not answer or answer == "" then
+        return nil, "no version selected"
+    end
+    local index = tonumber(answer)
+    if not index or index ~= math.floor(index) or index < 1 or index > #info.versions then
+        return nil, "invalid selection: '" .. answer .. "'"
+    end
+    return info.versions[index]
+end
+
+-- A version-specific removal must not leave a --locked pin pointing at a
+-- version that no longer exists, but the package declaration itself stays.
+local function prune_lock_version(target, version)
+    if not klua.file_exists(klua.paths.lock) then
+        return true
+    end
+    if not load_lockfile() then
+        return false
+    end
+    local canonical = canonical_lock_target(target)
+    local entry = klua.lockfile.entries[canonical]
+    if not entry or entry.version ~= version then
+        return true
+    end
+    klua.lockfile.entries[canonical] = nil
+    if dry_run() then
+        dry_run_notice("would remove stale lock entry for " .. canonical)
+        return true
+    end
+    if write_lockfile() ~= 0 then
+        return false
+    end
+    klua.info("lockfile pruned: removed stale pin for " .. canonical)
+    return true
+end
+
+local function remove_links_for_version(base, version)
+    local store_dir = normalize_dir(base) .. "/" .. version
+    local prefix = normalize_dir(store_dir)
+    local removed = {}
+    for _, name in ipairs(linked_binaries(base)) do
+        local target = klua.readlink(klua.paths.bin .. "/" .. name)
+        if target then
+            local full = normalize_dir(target)
+            if full == prefix or string.sub(full, 1, #prefix + 1) == prefix .. "/" then
+                local ok, err = klua.remove(klua.paths.bin .. "/" .. name)
+                if not ok then
+                    return nil, err
+                end
+                removed[#removed + 1] = name
+            end
+        end
+    end
+    return removed
+end
+
+-- ---------------------------------------------------------------------------
 -- Command handlers
 -- ---------------------------------------------------------------------------
 
@@ -2790,6 +3156,7 @@ function klua.commands.install(args)
     end
     local force = false
     local as_name = nil
+    local select_version = false
     local targets = {}
     local index = 1
     while index <= #args do
@@ -2803,14 +3170,38 @@ function klua.commands.install(args)
                 klua.error("--as requires a command name")
                 return 1
             end
+        elseif arg == "--select" then
+            select_version = true
         else
             targets[#targets + 1] = arg
         end
         index = index + 1
     end
     if #targets == 0 then
-        klua.error("usage: klua install [--force] [--as NAME] [--lock|--locked] <target> [<target>...]")
+        klua.error("usage: klua install [--force] [--as NAME] [--select] [--dry-run] <target> [<target>...]")
         return 1
+    end
+    if select_version then
+        if #targets ~= 1 then
+            klua.error("--select requires exactly one target")
+            return 1
+        end
+        local info, info_err = version_info(targets[1], true)
+        if not info then
+            klua.error(info_err)
+            return 1
+        end
+        local chosen, select_err = select_version_interactively(info)
+        if not chosen then
+            klua.error(select_err)
+            return 1
+        end
+        local base_target = split_at_tag(targets[1])
+        targets[1] = base_target .. "@" .. chosen
+    end
+    if dry_run() then
+        dry_run_notice("install preview for " .. #targets
+            .. " target(s); no files will be changed")
     end
     if as_name then
         if as_name == "" or as_name == "." or as_name == ".."
@@ -2844,6 +3235,9 @@ function klua.commands.install(args)
         end
     end
     klua.install_opts = saved
+    if dry_run() then
+        dry_run_notice("preview complete; store, links and lockfile were not changed")
+    end
     return status
 end
 
@@ -2866,7 +3260,7 @@ end
 
 -- Resolve a scheme target to its store directory (provider + package path,
 -- no version). Mirrors the layouts used by the install providers.
-local function store_path_for(scheme, rest)
+store_path_for = function(scheme, rest)
     if scheme == "gh" or scheme == "gl" then
         local repo = string.match(rest, "^([^@]+)") or rest
         local user, name = string.match(repo, "^([^/]+)/([^/]+)$")
@@ -2897,7 +3291,7 @@ end
 
 function klua.commands.remove(args)
     if #args == 0 then
-        klua.error("usage: klua remove <target> [<target>...]")
+        klua.error("usage: klua remove <target>[@VERSION] [<target>...]")
         return 1
     end
 
@@ -2907,9 +3301,10 @@ function klua.commands.remove(args)
         local scheme, rest = string.match(arg, "^([%w][%w+_-]*):(.+)$")
         local resolved = arg
         if not scheme then
-            local alias_target, err, candidates = resolve_alias(arg)
+            local name = split_at_tag(arg)
+            local alias_target, err, candidates = resolve_versioned_alias(arg)
             if not alias_target then
-                local match = closest_match(arg, candidates or {})
+                local match = closest_match(name or arg, candidates or {})
                 if match then
                     klua.warn("did you mean '" .. match .. "'?")
                 end
@@ -2922,17 +3317,66 @@ function klua.commands.remove(args)
         end
 
         if scheme then
-            local store_dir = store_path_for(scheme, rest)
-            if not store_dir or not klua.file_exists(store_dir) then
+            local base = store_path_for(scheme, rest)
+            local repo, requested_version = split_at_tag(rest)
+            if not base or not klua.file_exists(base) then
                 klua.error("package not installed: " .. arg)
                 status = 1
+            elseif requested_version then
+                if scheme == "url" then
+                    klua.error("url: packages have a single version; use 'klua remove "
+                        .. repo .. "'")
+                    status = 1
+                else
+                    local version_dir = normalize_dir(base) .. "/" .. requested_version
+                    if not klua.is_dir(version_dir) then
+                        klua.error("version '" .. requested_version .. "' is not installed for "
+                            .. scheme .. ":" .. repo)
+                        status = 1
+                    else
+                        local links, link_err = remove_links_for_version(base, requested_version)
+                        if not links then
+                            klua.error(tostring(link_err))
+                            status = 1
+                        else
+                            local ok, err = klua.remove(version_dir)
+                            if not ok then
+                                klua.error(tostring(err))
+                                status = 1
+                            else
+                                local suffix = #links > 0
+                                    and (" (" .. table.concat(links, ", ") .. ")") or ""
+                                klua.info("removed " .. scheme .. ":" .. repo .. "@"
+                                    .. requested_version .. suffix)
+                                if not prune_lock_version(scheme .. ":" .. repo,
+                                        requested_version) then
+                                    status = 1
+                                end
+                                local remaining = sorted_versions(klua.list_dir(base))
+                                if #remaining > 0 then
+                                    local fallback = remaining[#remaining].name
+                                    if relink_version(scheme, repo, fallback) == 0 then
+                                        klua.info("fallback to " .. fallback)
+                                    else
+                                        status = 1
+                                    end
+                                else
+                                    klua.info("no versions remain for " .. scheme .. ":" .. repo)
+                                    removed[arg] = true
+                                    removed[resolved] = true
+                                    removed[scheme .. ":" .. repo] = true
+                                end
+                            end
+                        end
+                    end
+                end
             else
                 local links = {}
                 for _, entry in ipairs(klua.list_dir(klua.paths.bin)) do
                     if not entry.is_dir then
                         local target = klua.readlink(entry.path)
-                        if target and (target == store_dir
-                            or string.sub(target, 1, #store_dir + 1) == store_dir .. "/") then
+                        if target and (target == base
+                            or string.sub(target, 1, #base + 1) == base .. "/") then
                             local ok, err = klua.remove(entry.path)
                             if not ok then
                                 klua.error(tostring(err))
@@ -2944,7 +3388,7 @@ function klua.commands.remove(args)
                     end
                 end
 
-                local ok, err = klua.remove(store_dir)
+                local ok, err = klua.remove(base)
                 if not ok then
                     klua.error(tostring(err))
                     status = 1
@@ -2976,7 +3420,7 @@ end
 -- ---------------------------------------------------------------------------
 
 -- Symlinks in ~/.local/bin that point into a package's store path.
-local function linked_binaries(store_base)
+linked_binaries = function(store_base)
     local base = normalize_dir(store_base)
     local links = {}
     for _, entry in ipairs(klua.list_dir(klua.paths.bin)) do
@@ -2992,7 +3436,7 @@ end
 
 -- Full store directory of the newest installed version (nil when missing).
 -- For `url:` packages the store path already ends in `/direct`.
-local function package_dir_for(scheme, rest)
+package_dir_for = function(scheme, rest)
     local base = store_path_for(scheme, rest)
     if not base then
         return nil
@@ -3008,14 +3452,15 @@ local function package_dir_for(scheme, rest)
 end
 
 -- Resolve an alias or a scheme target into (scheme, rest, resolved_target).
-local function resolve_target(arg)
+resolve_target = function(arg)
     local scheme, rest = string.match(arg, "^([%w][%w+_-]*):(.+)$")
     if scheme then
         return scheme, rest, arg
     end
-    local resolved, err, candidates = resolve_alias(arg)
+    local name = split_at_tag(arg)
+    local resolved, err, candidates = resolve_versioned_alias(arg)
     if not resolved then
-        local suggestion = closest_match(arg, candidates or {})
+        local suggestion = closest_match(name or arg, candidates or {})
         if suggestion then
             klua.warn("did you mean '" .. suggestion .. "'?")
         end
@@ -3378,6 +3823,58 @@ function klua.commands.info(args)
         klua.info("url:      " .. rest)
     end
     return 0
+end
+
+-- ---------------------------------------------------------------------------
+-- klua versions <target>
+-- ---------------------------------------------------------------------------
+
+function klua.commands.versions(args)
+    local target = args[1]
+    if not target or target == "" then
+        klua.error("usage: klua versions <target>")
+        return 1
+    end
+    local info, err = version_info(target, true)
+    if not info then
+        klua.error(err)
+        return 1
+    end
+    local _, pinned = split_at_tag(target)
+    klua.info("versions for " .. info.target .. ":")
+    for _, version in ipairs(info.versions) do
+        klua.info("  " .. format_version_line(version, info, pinned))
+    end
+    if #info.versions == 0 then
+        klua.info("  (no versions found)")
+    end
+    if not info.remote then
+        klua.info("(release API unavailable; listing installed versions)")
+    end
+    return 0
+end
+
+-- ---------------------------------------------------------------------------
+-- klua use <target>@<version> -- offline relink to an installed version
+-- ---------------------------------------------------------------------------
+
+function klua.commands.use(args)
+    local target = args[1]
+    if not target or target == "" then
+        klua.error("usage: klua use <target>@<version>")
+        return 1
+    end
+    local scheme, rest, resolved, err = resolve_target(target)
+    if not scheme then
+        klua.error(err)
+        return 1
+    end
+    local repo, version = split_at_tag(rest)
+    if not version or version == "" then
+        klua.error("usage: klua use <target>@<version> (for example gh:user/repo@v1.2.3)")
+        return 1
+    end
+    return relink_version(scheme, repo, version)
 end
 
 -- ---------------------------------------------------------------------------

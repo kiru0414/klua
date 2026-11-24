@@ -8,9 +8,11 @@ https://raw.githubusercontent.com/<user>/<repo>/<ref>/klua.yaml   (gh)
 https://gitlab.com/<user>/<repo>/-/raw/<ref>/klua.yaml            (gl)
 ```
 
-`<ref>` is the pinned tag (`repo@tag`) or `HEAD`. If the file exists and
-parses, it overrides the release heuristics. If it is missing, invalid, or
-comment-only, klua silently falls back to asset scoring.
+`<ref>` is the pinned tag (`repo@tag`) or `HEAD`. `@VERSION` pins also work
+for bare aliases (`klua install rg@14.0.0` resolves the alias first, then pins
+the release), not only for scheme targets. If the file exists and parses, it
+overrides the release heuristics. If it is missing, invalid, or comment-only,
+klua silently falls back to asset scoring.
 
 > **Safer than Homebrew, simpler than Nix, and infinitely hackable in Lua.**
 > A manifest only describes what lives in the isolated store; the core decides

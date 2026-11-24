@@ -271,7 +271,7 @@ export PATH="$HOME/.local/bin:$PATH"
 # --- version and CLI surface -------------------------------------------------
 run --version
 check "--version exits 0" 0 $?
-expect_output "version is 0.8.0" "klua 0.8.0"
+expect_output "version is 0.9.0" "klua 0.9.0"
 
 run install --help
 expect_output "install help lists --locked" "--locked"

@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.24)
 set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
 
 project(klua
-    VERSION 0.8.0
+    VERSION 0.9.0
     DESCRIPTION "A fast, self-healing package manager powered by C++20 and Lua 5.4"
     LANGUAGES C CXX)
 

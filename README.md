@@ -211,6 +211,34 @@ preview release are implemented:
   template; a Lua `klua.verify.hook(context)` may inspect or reject the payload
   directly. Verification fails closed.
 
+**v0.9.0 — version selection & offline switching**
+
+- `klua install --dry-run <target>` now prints a clean preview: the resolved
+  package, its version and the planned `sys:` commands. It never modifies the
+  store, links or `packages.lock.yaml`.
+- Linux system package managers (`apt`/`apt-get`, `dnf`, `yum`, `pacman`,
+  `apk`) are automatically prefixed with `sudo` when the user is not root and
+  `sudo` is available. Homebrew (`brew`) is never elevated.
+- HTTP downloads and release discovery follow `301/302/307/308` redirects
+  across hosts, sending `User-Agent: klua/<version>` on every hop and dropping
+  API tokens when the host or API path changes. This fixes `HTTP 403` on
+  GitHub repo renames and githubusercontent S3 URLs.
+- `@VERSION` pins work for aliases too: `klua install rg@14.0.0` resolves the
+  alias first and then pins that release.
+- `klua versions <target>` lists available releases from the GitHub/GitLab
+  API, marking installed, active and pinned versions. When the API is
+  unavailable it falls back to locally installed versions.
+- `klua install --select <target>` shows a numbered release menu and installs
+  the pinned version you choose (requires a TTY/stdin answer).
+- `klua use <target>@<version>` relinks instantly **offline** to an installed
+  version: no download, API call or store extraction. It reuses the exact link
+  set recorded at install time, falling back to executable discovery when no
+  snapshot exists.
+- `klua remove <target>@<version>` removes only that stored version and
+  relinks the newest remaining one. Removing the last version prunes symlinks
+  and package/lock entries as before, and a stale `--locked` pin for the
+  removed version is dropped.
+
 **v0.8.0 — explicit approval, previews & drift reporting**
 
 - `install`, `remove`, `run`, `sync` and `upgrade` accept `--yes` / `-y`.
@@ -275,6 +303,11 @@ klua tap add https://example.com/klua-registry  # register an alias registry
 klua install fd               # alias sharding -> v1/f.yaml -> gh:sharkdp/fd
 klua install gh:jqlang/jq     # direct GitHub Releases install
 klua i gh:jqlang/jq@jq-1.7.1  # pinned tag
+klua install rg@14.0.0       # pin a release through an alias
+klua install --dry-run fd    # preview resolved package, version, sys commands
+klua install --select jq     # choose a release from a numbered menu (TTY)
+klua versions jq             # list releases; mark installed/active/pinned
+klua use jq@jq-1.7.1         # offline relink to an installed version
 klua install --force git      # override shadowing/protected-command guard
 klua install --as jq2 jq      # link the primary binary as ~/.local/bin/jq2
 klua install --no-cache fd    # refetch the registry shard instead of using cache
@@ -299,6 +332,7 @@ klua sync https://host/dotfiles.yaml  # remote source, follows includes:
 klua upgrade --dry-run        # preview version changes and sys commands
 klua upgrade                  # upgrade all installed packages
 klua remove fd                # delete links, store dir, packages.yaml + lock entries
+klua remove jq@jq-1.7.1       # remove one version; relink the newest
 klua rm gh:jqlang/jq          # alias of remove
 klua uninstall url:https://host/tool.tar.gz  # alias of remove
 klua list                     # installed packages from the store

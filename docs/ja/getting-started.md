@@ -12,7 +12,7 @@ klua は自己修復型のパッケージマネージャーです。C++20 コア
 
 すべての `v*` リリースには、静的リンクされた Linux バイナリ（x86_64、arm64）と macOS バイナリが添付されています:
 
-[v0.8.0](https://github.com/kiru0414/klua/releases/download/v0.8.0/klua-v0.8.0-linux-x86_64.tar.gz)
+[v0.9.0](https://github.com/kiru0414/klua/releases/download/v0.9.0/klua-v0.9.0-linux-x86_64.tar.gz)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/kiru0414/klua/main/install.sh | bash
@@ -68,7 +68,7 @@ Windows では WSL 内でビルドしてください。サポート対象は POS
 ## CLI
 
 ```
-klua install [--force] [--as NAME] [--no-cache] [--skip-checksum] [--lock|--locked] [--yes] <target>...  (alias: klua i)
+klua install [--force] [--as NAME] [--no-cache] [--skip-checksum] [--lock|--locked] [--dry-run] [--select] [--yes] <target>...  (alias: klua i)
 klua run [--no-cache] [--skip-checksum] [--yes] [--upgrade|--latest] <target> [--] [args...]  # store-only
 klua search [--no-cache] <query>
 klua info [--no-cache] <target>
@@ -79,6 +79,8 @@ klua remove [--no-cache] [--yes] <target>...    (aliases: klua rm, klua uninstal
 klua sync [--no-cache] [--skip-checksum] [--lock|--locked] [--dry-run] [--yes] [path_or_url]
 klua upgrade [--no-cache] [--skip-checksum] [--lock] [--dry-run] [--yes] [target...]
 klua outdated [--no-cache] [target...]
+klua versions [--no-cache] <target>
+klua use <target>@<version>
 klua tap <add|remove|list> [url]
 klua list
 klua repair [--dry-run|--diff]
@@ -122,6 +124,8 @@ klua install fd                  # alias -> v1/f.yaml -> gh:sharkdp/fd
 リリースの検出は、失敗に備えた 3 段階の連鎖です。expanded-assets ページが取得できない場合や、解析の結果ダウンロードリンクが **0 件** の場合、klua は直ちに次に `releases.atom` を読み取ります。フィードにも利用可能なアセットリンクがない場合、最後に REST API を呼び出します。空のスクレイピング結果は常に失敗とみなされ、空の成功として扱われることはありません。したがって、GitHub のレイアウトが変更されても、壊れたインストールが黙って作られることはありません。成功した解決結果は、そのコマンドの実行中はキャッシュされます。
 
 REST 段階が実行されると、`GITHUB_TOKEN` または `GH_TOKEN`（この順序で）が `Authorization: Bearer ...` として自動的に送信されます。信頼できるカスタム API ホストについては、そのホスト名を `KLUA_GITHUB_API_HOST` に設定します。トークンはそのホストの API らしいパスにのみ送られます。
+
+HTTP リクエストは `301/302/307/308` のリダイレクトをホストをまたいで追跡し、各ホップで `User-Agent: klua/<version>` を送信します。ホストや API パスが変わった時点で API トークンは破棄されるため、GitHub のリポジトリ名変更や githubusercontent の S3 URL での `HTTP 403` が解消されます。
 
 GitLab のリリースでは `klua.gitlab_api` を直接利用します。`GITLAB_TOKEN` が設定されている場合、GitLab API のエンドポイントへのリクエストには `PRIVATE-TOKEN` と `Authorization: Bearer ...` の両方が付与されます。セルフホスト環境では、ホスト名を `KLUA_GITLAB_API_HOST` に設定してください。いずれの場合も、トークンは API らしいパス（`/api/...` または `/repos/...`）にのみ付与され、生ファイルやアセットのダウンロードには付与されません。
 
@@ -182,7 +186,7 @@ klua sync -y
 
 ### システムパッケージの委譲
 
-`sys:pkg1,pkg2,...` と明示的なマネージャースキーム（`apt:`、`apt-get:`、`dnf:`、`yum:`、`pacman:`、`apk:`、`brew:`）は、ホストのパッケージマネージャーに処理を委譲します。klua はまず各パッケージのインストール状態を確認し、すでに存在するものはスキップして、残りをキューに入れます。1 回の CLI 実行で見つかった未インストールのパッケージは、パッケージごとに `sudo` を起動するのではなく、**1 つ** のマネージャーコマンド（Debian/Ubuntu では `sudo apt-get install -y ...`、macOS では `brew install ...` など）でインストールされます。マニフェストの [`depends:`](klua-yaml.md#depends) に記載されたパッケージも同じキューを使用します。
+`sys:pkg1,pkg2,...` と明示的なマネージャースキーム（`apt:`、`apt-get:`、`dnf:`、`yum:`、`pacman:`、`apk:`、`brew:`）は、ホストのパッケージマネージャーに処理を委譲します。klua はまず各パッケージのインストール状態を確認し、すでに存在するものはスキップして、残りをキューに入れます。1 回の CLI 実行で見つかった未インストールのパッケージは、パッケージごとに `sudo` を起動するのではなく、**1 つ** のマネージャーコマンド（Debian/Ubuntu では `sudo apt-get install -y ...`、macOS では `brew install ...` など）でインストールされます。マニフェストの [`depends:`](klua-yaml.md#depends) に記載されたパッケージも同じキューを使用します。root 以外で `sudo` が利用可能な場合、`apt`/`apt-get`、`dnf`、`yum`、`pacman`、`apk` のコマンドには自動的に `sudo` が付与されます。`brew` は昇格させません。
 
 ```sh
 klua install sys:git,curl,wget   # one batch; already-installed packages skipped
@@ -219,9 +223,10 @@ klua install --locked gh:jqlang/jq
 
 ### ドライランによるプレビュー
 
-`sync --dry-run` と `upgrade --dry-run` は、入力を解決して実行される内容を表示します。未インストールの `sys:` パッケージに対して生成されるシェルコマンドも正確に表示されます。アーカイブのダウンロード、ストアの変更、リンクの作成、ロックファイルへの書き込みは行いません。`upgrade --dry-run` は予定されたバージョン変更を `v1.0.0 -> v2.0.0` の形式で報告します。`--dry-run` は `--lock` と併用できません。実際のコマンドの前に、読み取り専用の計画ステップとして利用してください。
+`sync --dry-run` と `upgrade --dry-run` は、入力を解決して実行される内容を表示します。未インストールの `sys:` パッケージに対して生成されるシェルコマンドも正確に表示されます。アーカイブのダウンロード、ストアの変更、リンクの作成、ロックファイルへの書き込みは行いません。`upgrade --dry-run` は予定されたバージョン変更を `v1.0.0 -> v2.0.0` の形式で報告します。`--dry-run` は `--lock` と併用できません。実際のコマンドの前に、読み取り専用の計画ステップとして利用してください。`install --dry-run <target>` も単一のインストールに対して同じ読み取り専用の経路を使い、解決されたパッケージ、バージョン、予定される `sys:` コマンドを表示します。ストア、リンク、ロックファイルは変更しません。
 
 ```sh
+klua install --dry-run jq           # preview one install
 klua sync --dry-run                 # preview packages.yaml actions
 klua upgrade --dry-run gh:jqlang/jq # preview one upgrade
 ```
@@ -302,6 +307,18 @@ klua outdated gh:jqlang/jq       # check one explicit target
 複数のパッケージを同時にアップグレードする場合、`upgrade` は `sync` と同じ並列事前取得を使用します。
 
 最新リリースを再インストールし、`upgraded X: old -> new` または `X is up to date (version)` を報告します。`--lock` を追加すると、新たに解決されたバージョンでロック済みエントリを更新できます。`outdated` は読み取り専用です。インストール済みの `gh:` / `gl:` バージョンを最新リリースと比較し、アップグレード可能なものには `outdated: <target> <installed> -> <latest>` を、それ以外の場合は `outdated: all checked packages are up to date` を出力します。
+
+### バージョン選択
+
+```sh
+klua install rg@14.0.0       # エイリアスを解決してからリリースを固定
+klua install --select jq     # リリースの番号付きメニュー（TTY が必要）
+klua versions jq             # リリース一覧（インストール済み・有効・固定を表示）
+klua use jq@jq-1.7.1         # インストール済みバージョンへオフラインで再リンク
+klua remove jq@jq-1.7.1      # そのバージョンのみ削除し、最新を再リンク
+```
+
+`@VERSION` による固定はスキーム付きターゲットだけでなくエイリアスにも適用されます。`versions` は GitHub/GitLab API から利用可能なリリースを一覧表示し、インストール済み・有効・固定済みのバージョンを示します。API が使えない場合はローカルのインストール済みバージョンにフォールバックします。`--select` は番号付きメニューを表示し、入力した番号のバージョンを固定してインストールします（TTY/stdin の回答がない場合は中止します）。`use` は完全にオフラインで、ダウンロード、API 呼び出し、展開を行わず、インストール時に記録されたリンク一式を再利用します（記録がない場合のみ実行ファイルを検出します）。`remove` に `@version` を付けるとそのバージョンだけを削除し、残る最新バージョンへ再リンクします。最後のバージョンを削除した場合は従来どおりシンボリックリンクとパッケージ／ロックのエントリを整理し、古い `--locked` 固定も解除します。
 
 ### tap / list
 
