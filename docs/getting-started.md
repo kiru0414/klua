@@ -19,7 +19,7 @@ Static Linux binaries (x86_64, arm64) and macOS binaries are attached to
 every `v*` release:
 
 ```sh
-curl -LO https://github.com/kiru0414/klua/releases/latest/download/klua-v0.8.0-linux-x86_64.tar.gz
+curl -LO https://github.com/kiru0414/klua/releases/download/v0.8.0/klua-v0.8.0-linux-x86_64.tar.gz
 tar -xzf klua-v0.8.0-linux-x86_64.tar.gz
 install -m 755 klua ~/.local/bin/klua   # or /usr/local/bin
 klua --version
