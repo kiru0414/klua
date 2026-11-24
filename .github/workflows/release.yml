@@ -22,9 +22,6 @@ jobs:
           - os: ubuntu-24.04-arm
             artifact: linux-arm64
             static: true
-          - os: macos-13
-            artifact: macos-x86_64
-            static: false
           - os: macos-14
             artifact: macos-arm64
             static: false
@@ -61,7 +58,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          tar -czf "dist/klua-${{ github.ref_name }}-${{ matrix.artifact }}.tar.gz" \
+          tar -czf "dist/klua-${{ matrix.artifact }}.tar.gz" \
             -C build klua \
             -C "$GITHUB_WORKSPACE" README.md LICENSE
 
