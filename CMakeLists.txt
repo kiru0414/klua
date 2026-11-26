@@ -4,6 +4,8 @@ cmake_minimum_required(VERSION 3.24)
 # Their deprecation notices are not actionable by klua and would otherwise
 # make a clean configure noisy. klua's own CMake uses current APIs.
 set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
+# Allow dependencies with cmake_minimum_required < 3.5 to configure on CMake 4.0+.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 
 project(klua
     VERSION 0.9.0
@@ -52,12 +54,20 @@ FetchContent_MakeAvailable(cli11)
 # sol2: use the header tree directly so its own CMake logic
 # (which probes for a system Lua) never runs.
 FetchContent_Declare(sol2
-    GIT_REPOSITORY https://github.com/ThePhD/sol2.git
+    GIT_REPOSITORY https://github.com
     GIT_TAG        v3.3.0
     GIT_SHALLOW    TRUE)
 FetchContent_GetProperties(sol2)
 if(NOT sol2_POPULATED)
     FetchContent_Populate(sol2)
+    # Fix two-phase name lookup error in sol2 v3.3.0 on Clang 19+ / Apple Clang 16+
+    set(_sol2_opt_hdr "${sol2_SOURCE_DIR}/include/sol/optional_implementation.hpp")
+    file(READ "${_sol2_opt_hdr}" _sol2_opt_content)
+    string(REPLACE
+        "this->construct(std::forward<Args>(args)...);"
+        "::new (static_cast<void*>(std::addressof(this->m_storage.m_value))) T(std::forward<Args>(args)...);"
+        _sol2_opt_content "${_sol2_opt_content}")
+    file(WRITE "${_sol2_opt_hdr}" "${_sol2_opt_content}")
 endif()
 add_library(klua_sol2 INTERFACE)
 target_include_directories(klua_sol2 INTERFACE "${sol2_SOURCE_DIR}/include")
