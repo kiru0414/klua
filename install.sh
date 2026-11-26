@@ -10,7 +10,7 @@ case "$ARCH" in
 esac
 
 INSTALL_DIR="${KLUA_INSTALL_DIR:-$HOME/.local/bin}"
-URL="https://github.com{OS}-${ARCH}.tar.gz"
+URL="https://github.com${OS}-${ARCH}.tar.gz"
 
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
