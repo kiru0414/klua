@@ -2,6 +2,11 @@
 set -eu
 
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+case "$OS" in
+  linux*) OS="linux" ;;
+  darwin*) OS="macos" ;;
+  *) echo "Unsupported OS: $OS" >&2; exit 1 ;;
+esac
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64|amd64) ARCH="x86_64" ;;
