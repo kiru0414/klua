@@ -55,8 +55,7 @@ FetchContent_MakeAvailable(cli11)
 # (which probes for a system Lua) never runs.
 FetchContent_Declare(sol2
     GIT_REPOSITORY https://github.com/ThePhD/sol2.git
-    GIT_TAG        v3.3.0
-    GIT_SHALLOW    TRUE)
+    GIT_TAG        d805d02)
 FetchContent_GetProperties(sol2)
 if(NOT sol2_POPULATED)
     FetchContent_Populate(sol2)
