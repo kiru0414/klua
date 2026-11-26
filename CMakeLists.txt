@@ -59,14 +59,6 @@ FetchContent_Declare(sol2
 FetchContent_GetProperties(sol2)
 if(NOT sol2_POPULATED)
     FetchContent_Populate(sol2)
-    # Fix two-phase name lookup error in sol2 v3.3.0 on Clang 19+ / Apple Clang 16+
-    set(_sol2_opt_hdr "${sol2_SOURCE_DIR}/include/sol/optional_implementation.hpp")
-    file(READ "${_sol2_opt_hdr}" _sol2_opt_content)
-    string(REPLACE
-        "this->construct(std::forward<Args>(args)...);"
-        "::new (static_cast<void*>(std::addressof(this->m_storage.m_value))) T(std::forward<Args>(args)...);"
-        _sol2_opt_content "${_sol2_opt_content}")
-    file(WRITE "${_sol2_opt_hdr}" "${_sol2_opt_content}")
 endif()
 
 add_library(klua_sol2 INTERFACE)
