@@ -54,7 +54,7 @@ FetchContent_MakeAvailable(cli11)
 # sol2: use the header tree directly so its own CMake logic
 # (which probes for a system Lua) never runs.
 FetchContent_Declare(sol2
-    GIT_REPOSITORY https://github.com
+    GIT_REPOSITORY https://github.com/ThePhD/sol2.git
     GIT_TAG        v3.3.0
     GIT_SHALLOW    TRUE)
 FetchContent_GetProperties(sol2)
@@ -69,6 +69,7 @@ if(NOT sol2_POPULATED)
         _sol2_opt_content "${_sol2_opt_content}")
     file(WRITE "${_sol2_opt_hdr}" "${_sol2_opt_content}")
 endif()
+
 add_library(klua_sol2 INTERFACE)
 target_include_directories(klua_sol2 INTERFACE "${sol2_SOURCE_DIR}/include")
 
