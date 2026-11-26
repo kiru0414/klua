@@ -47,7 +47,7 @@ jobs:
         run: cmake --build build -j 4
 
       - name: Ad-hoc sign (macOS)
-        if: runner.os == macOS
+        if: runner.os == 'macOS'
         run: codesign -s - --force ./build/klua
 
       - name: Smoke test
