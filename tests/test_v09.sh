@@ -216,7 +216,7 @@ EOF
 # --- CLI surface and version -------------------------------------------------
 run --version
 check "--version exits 0" 0 $?
-expect_output "version is 0.9.0" "klua 0.9.0"
+expect_output "version is 0.9.1" "klua 0.9.1"
 
 run install --help
 expect_output "install help lists --dry-run" "--dry-run"

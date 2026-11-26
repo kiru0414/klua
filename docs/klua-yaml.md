@@ -211,7 +211,9 @@ depends:
   `klua.system.install(pkgs)` can override detection and commands in
   `init.lua`; see [lua-api.md](lua-api.md#system-package-delegation).
 - A failed system install fails the overall install; system packages are not
-  recorded in `packages.lock.yaml`.
+  recorded in `packages.lock.yaml`. Since v0.9.1 they are tracked as
+  lightweight `sys/<manager>/<pkg>` store markers, so `klua list` shows
+  `sys:ffmpeg (apt)` and `klua remove sys:ffmpeg` uninstalls via that manager.
 
 ## build.steps
 

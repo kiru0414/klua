@@ -34,6 +34,15 @@ primitives below.
   `releases.atom` before the REST API; verified checksums and optional
   signature hooks gate extraction. Both policies live in the baseline Lua and
   can be replaced.
+- Release listing for `klua versions` and `klua install --select` follows the
+  same ordering: `releases.atom`, then the releases web page, and only then
+  `api.github.com`, so custom listings stay below the unauthenticated
+  60-request/hour REST limit. A custom handler overriding these commands
+  should keep the same preference.
+- `klua.commands.cleanup` honors versions that are currently active via
+  `~/.local/bin` symlinks and versions pinned in `packages.lock.yaml`; it
+  removes only genuinely old, unprotected versions. Wrappers around `cleanup`
+  should preserve those guards.
 - Independent HTTP requests use the bounded batch primitives so `search`,
   `sync` and `upgrade` stay fast without creating unbounded threads.
 
@@ -41,7 +50,7 @@ primitives below.
 
 | Name | Type | Meaning |
 | ---- | ---- | ------- |
-| `klua.version` | string | klua version, e.g. `"0.9.0"` |
+| `klua.version` | string | klua version, e.g. `"0.9.1"` |
 | `klua.paths` | table | `config`, `store`, `bin`, `cache`, `shards`, `init`, `packages`, `lock`, `taps` (absolute path strings) |
 | `klua.providers` | table | scheme -> `function(rest, target)` |
 | `klua.commands` | table | command name -> `function(args)` returning an exit code |
@@ -49,7 +58,7 @@ primitives below.
 | `klua.registries` | array | registry base URLs for alias sharding (defaults to the official registry) |
 | `klua.shard_ttl` | number | registry shard cache lifetime in seconds (default `3600`); `0` disables reuse |
 | `klua.cli_flags` | table | `no_cache`, `skip_checksum`, `locked`, `lock`, `yes`, `latest`, `upgrade`, `dry_run`, published from CLI switches before dispatch |
-| `klua.system` | table | system package delegation overrides: `manager`, `status`, `install` |
+| `klua.system` | table | system package delegation overrides: `manager`, `status`, `install`, `uninstall` |
 | `klua.lockfile` | table | parsed `packages.lock.yaml` state (`entries`, `loaded`) and helpers, including `prune` |
 | `klua.verify` | table | optional signature hooks: `command`, `hook` |
 
@@ -130,6 +139,15 @@ why scripts use `--yes` / `-y`. The baseline publishes that flag as
 `klua.prompt(prompt)` prints the prompt and returns the trimmed answer, or
 `nil` on EOF. `install --select` uses it to read the chosen release index; a
 `nil` answer cancels the selection.
+
+v0.9.1 does not change existing Lua signatures: `klua.prompt`, `klua.confirm`,
+the `klua.system` and `klua.lockfile` tables, and all primitives below keep
+their current behavior. The only additions are the optional
+`klua.system.uninstall` / `uninstall_cmd` hooks documented under
+[System package delegation](#system-package-delegation). The new `.klua-links`
+snapshot format (`<link_name>=<relative_target_path>` pairs) is written and
+consumed by the baseline; custom handlers do not need to change, and legacy
+entries without `=` are still read.
 
 `klua.cli_flags.dry_run` is true for `install --dry-run` / `sync --dry-run` /
 `upgrade --dry-run`. The baseline branches on it to print `dry-run: ...`
@@ -224,13 +242,13 @@ packages for a single install batch. Status is checked before queuing, and
 duplicate names are removed. The default manager is detected from the tools
 available at runtime:
 
-| Manager | Status probe | Install command |
-| ------- | ------------ | --------------- |
-| `apt` | `dpkg-query -W -f='${Status}' <pkg>` | `apt-get install -y -- <pkgs>` |
-| `dnf` / `yum` | `rpm -q <pkg>` | `dnf install -y <pkgs>` / `yum install -y <pkgs>` |
-| `pacman` | `pacman -Q <pkg>` | `pacman -S --noconfirm -- <pkgs>` |
-| `apk` | `apk info -e <pkg>` | `apk add <pkgs>` |
-| `brew` | `brew list <pkg>` | `brew install <pkgs>` |
+| Manager | Status probe | Install command | Uninstall command |
+| ------- | ------------ | --------------- | ----------------- |
+| `apt` | `dpkg-query -W -f='${Status}' <pkg>` | `apt-get install -y -- <pkgs>` | `apt-get remove -y -- <pkgs>` |
+| `dnf` / `yum` | `rpm -q <pkg>` | `dnf install -y <pkgs>` / `yum install -y <pkgs>` | `dnf remove -y <pkgs>` / `yum remove -y <pkgs>` |
+| `pacman` | `pacman -Q <pkg>` | `pacman -S --noconfirm -- <pkgs>` | `pacman -R --noconfirm -- <pkgs>` |
+| `apk` | `apk info -e <pkg>` | `apk add <pkgs>` | `apk del <pkgs>` |
+| `brew` | `brew list <pkg>` | `brew install <pkgs>` | `brew uninstall <pkgs>` |
 
 All commands go through the shell with single-quote escaping, and `sudo` is
 prepended once for the whole batch when the process is not root (never for
@@ -242,9 +260,10 @@ klua.system = {
     manager = "apt",
     status_cmd = "dpkg-query -W -f='${Status}' %s 2>/dev/null | grep -qx 'install ok installed'",
     install_cmd = "apt-get install -y -- %s",
+    uninstall_cmd = "apt-get remove -y -- %s",
 }
 
--- Option 2: full hooks. `install` receives the whole missing batch as an array.
+-- Option 2: full hooks. `install` / `uninstall` receive an array of packages.
 klua.system = {
     manager = "nix",
     status = function(pkg)
@@ -253,14 +272,24 @@ klua.system = {
     install = function(pkgs)
         return klua.exec("nix profile install nixpkgs#" .. table.concat(pkgs, " nixpkgs#"))
     end,
+    uninstall = function(pkgs)
+        return klua.exec("nix profile remove " .. table.concat(pkgs, " "))
+    end,
 }
 ```
 
-`status(pkg)` returns true (or numeric `0`) when installed; `install(pkgs)`
-returns `0`/true on success. Both hooks are optional, but a custom
-`manager` string without a known implementation needs both. Manifest
-`depends:` entries without a scheme, or with a system scheme, use this same
-batch; other targets are dispatched through their normal provider.
+`status(pkg)` returns true (or numeric `0`) when installed; `install(pkgs)` and
+`uninstall(pkgs)` return `0`/true on success. The install hooks are optional,
+but a custom `manager` string without a known implementation needs at least
+`status` and `install`; a custom removal path needs `uninstall` or
+`uninstall_cmd`. Manifest `depends:` entries without a scheme, or with a system
+scheme, use the same install batch; other targets are dispatched through their
+normal provider.
+
+Since v0.9.1, successful delegation records a lightweight marker at
+`~/.local/share/klua/store/sys/<manager>/<pkg>/`. `klua list` shows those
+entries as `sys:<pkg> (<manager>)`, and `klua remove sys:<pkg>` calls the
+recorded manager's uninstaller and deletes the marker.
 
 ## Lockfile
 

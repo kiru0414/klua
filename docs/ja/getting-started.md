@@ -12,7 +12,7 @@ klua は自己修復型のパッケージマネージャーです。C++20 コア
 
 すべての `v*` リリースには、静的リンクされた Linux バイナリ（x86_64、arm64）と macOS バイナリが添付されています:
 
-[v0.9.0](https://github.com/kiru0414/klua/releases/download/v0.9.0/klua-v0.9.0-linux-x86_64.tar.gz)
+[v0.9.1](https://github.com/kiru0414/klua/releases/download/v0.9.1/klua-v0.9.1-linux-x86_64.tar.gz)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/kiru0414/klua/main/install.sh | bash
@@ -191,7 +191,11 @@ klua sync -y
 ```sh
 klua install sys:git,curl,wget   # one batch; already-installed packages skipped
 klua install apt:jq              # force a particular manager scheme
+klua list                        # also lists sys:ffmpeg (apt) markers
+klua remove sys:ffmpeg           # uninstall via recorded manager; delete marker
 ```
+
+委譲されたパッケージは追跡され、`~/.local/share/klua/store/sys/<manager>/<pkg>/` に軽量マーカーが記録されます。`klua list` には `sys:ffmpeg (apt)` のように表示され、`klua remove sys:<pkg>` は記録されたマネージャーのアンインストーラー（Linux の非 root では sudo 付き）を呼び出してマーカーを削除します。
 
 マネージャーは実行時に `dpkg-query`、`dnf`、`yum`、`pacman`、`apk`、`brew` から検出されます。`init.lua` で `klua.system.manager` を設定して上書きするか、独自環境向けに `klua.system.status(pkg)` / `klua.system.install(pkgs)` フックを提供できます。詳細は [lua-api.md](lua-api.md#system-package-delegation) を参照してください。
 
@@ -272,11 +276,11 @@ klua info fd        # alias resolution, installed versions, links, release info
 ### cleanup / doctor
 
 ```sh
-klua cleanup        # keep newest version per package; remove stale links/caches
+klua cleanup        # remove old unprotected versions, stale links/caches
 klua doctor         # report dirs, PATH, registries, broken/shadowed links
 ```
 
-バージョンの並び順は数字を考慮します（`1.10.0` は `1.9.0` より新しいと判定されます）。`cleanup` は古いストアバージョン、存在しないストアファイルを指すシンボリックリンク、ライブラリへのリンク、および `downloads/` と `build/` のキャッシュを削除します。`doctor` が終了コード `1` を返すのは実際のエラー（書き込み不可のディレクトリなど）がある場合のみで、警告は参考情報です。
+バージョンの並び順は数字を考慮します（`1.10.0` は `1.9.0` より新しいと判定されます）。`cleanup` は古いストアバージョン、存在しないストアファイルを指すシンボリックリンク、ライブラリへのリンク、および `downloads/` と `build/` のキャッシュを削除しますが、闇雲に削除はしません。`~/.local/bin` のシンボリックリンクで現在有効なバージョンと `packages.lock.yaml` で固定されたバージョンは保護され、本当に古い未保護のバージョンだけが削除されます。`doctor` が終了コード `1` を返すのは実際のエラー（書き込み不可のディレクトリなど）がある場合のみで、警告は参考情報です。
 
 ### add / sync
 
@@ -312,13 +316,13 @@ klua outdated gh:jqlang/jq       # check one explicit target
 
 ```sh
 klua install rg@14.0.0       # エイリアスを解決してからリリースを固定
-klua install --select jq     # リリースの番号付きメニュー（TTY が必要）
-klua versions jq             # リリース一覧（インストール済み・有効・固定を表示）
-klua use jq@jq-1.7.1         # インストール済みバージョンへオフラインで再リンク
+klua install --select jq     # リリースの番号付きメニュー（Atom/Web 優先、API は最後）
+klua versions jq             # リリース一覧（Atom/Web 優先、インストール済み・有効・固定を表示）
+klua use jq@jq-1.7.1         # オフライン再リンク；--as の名前を保持
 klua remove jq@jq-1.7.1      # そのバージョンのみ削除し、最新を再リンク
 ```
 
-`@VERSION` による固定はスキーム付きターゲットだけでなくエイリアスにも適用されます。`versions` は GitHub/GitLab API から利用可能なリリースを一覧表示し、インストール済み・有効・固定済みのバージョンを示します。API が使えない場合はローカルのインストール済みバージョンにフォールバックします。`--select` は番号付きメニューを表示し、入力した番号のバージョンを固定してインストールします（TTY/stdin の回答がない場合は中止します）。`use` は完全にオフラインで、ダウンロード、API 呼び出し、展開を行わず、インストール時に記録されたリンク一式を再利用します（記録がない場合のみ実行ファイルを検出します）。`remove` に `@version` を付けるとそのバージョンだけを削除し、残る最新バージョンへ再リンクします。最後のバージョンを削除した場合は従来どおりシンボリックリンクとパッケージ／ロックのエントリを整理し、古い `--locked` 固定も解除します。
+`@VERSION` による固定はスキーム付きターゲットだけでなくエイリアスにも適用されます。`versions` は利用可能なリリースを一覧表示し、インストール済み・有効・固定済みのバージョンを示します。GitHub ではまず `releases.atom`、次にリリースの Web ページを試し、両方失敗した場合にのみ `api.github.com` を呼ぶため、未認証の 1 時間 60 リクエスト制限を回避できます。`install --select` も同じ API を使わない経路で番号付きメニューを表示し、入力した番号のバージョンを固定してインストールします（TTY/stdin の回答がない場合は中止します）。GitLab は従来どおり GitLab API を使用し、すべて失敗した場合はローカルのインストール済みバージョンにフォールバックします。`use` は完全にオフラインで、ダウンロード、API 呼び出し、展開を行わず、インストール時に記録されたリンク一式を再利用します。`.klua-links` スナップショットは `<link_name>=<relative_target_path>` の組を保存するため、`klua install --as jq2 ...` のカスタム名がバージョン切り替え後も保持されます（`=` のない旧形式も読み取れます）。実行ファイルの検出は記録がない場合のフォールバックです。`remove` に `@version` を付けるとそのバージョンだけを削除し、残る最新バージョンへ再リンクします。最後のバージョンを削除した場合は従来どおりシンボリックリンクとパッケージ／ロックのエントリを整理し、古い `--locked` 固定も解除します。
 
 ### tap / list
 
@@ -326,8 +330,10 @@ klua remove jq@jq-1.7.1      # そのバージョンのみ削除し、最新を�
 klua tap add https://example.com/my-registry
 klua tap list
 klua tap remove https://example.com/my-registry
-klua list                        # provider:user/repo  version, from the store
+klua list                        # provider:user/repo version; sys markers too
 ```
+
+ストア内のパッケージに加え、`klua list` は `sys:ffmpeg (apt)` のような追跡済みシステムパッケージも表示します。アンインストールするには `klua remove sys:ffmpeg` を使用してください。
 
 ### remove / rm / uninstall
 

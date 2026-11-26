@@ -139,7 +139,7 @@ depends:
 - マニフェストとコマンドラインにわたる不足パッケージはすべて、`klua` の 1 回の実行につき 1 回、まとめてインストールされます。ソースビルドの場合、最初の `build.steps` コマンドが実行される前にこのバッチがフラッシュされます。
 - 非システムのターゲット（例: `gh:user/repo` や単独のエイリアス）は通常のプロバイダーを通じてインストールされ、実行ごとに重複排除されます。
 - `klua.system.manager`、`klua.system.status(pkg)`、`klua.system.install(pkgs)` で `init.lua` 内の検出とコマンドを上書きできます。詳細は [lua-api.md](lua-api.md#system-package-delegation) を参照してください。
-- システムパッケージのインストールが失敗すると全体のインストールも失敗します。システムパッケージは `packages.lock.yaml` には記録されません。
+- システムパッケージのインストールが失敗すると全体のインストールも失敗します。システムパッケージは `packages.lock.yaml` には記録されませんが、v0.9.1 以降は軽量な `sys/<manager>/<pkg>` ストアマーカーとして追跡され、`klua list` に `sys:ffmpeg (apt)` と表示されます。`klua remove sys:ffmpeg` でそのマネージャー経由でアンインストールできます。
 
 ## build.steps（ソースビルド手順）
 

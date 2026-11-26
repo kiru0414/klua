@@ -17,13 +17,15 @@ klua でカスタマイズできるものはすべて `~/.config/klua/init.lua` 
 - ベースラインはリンク前に `klua.env("PATH")` を走査し、コアコマンドを保護します。CLI からのインストールでは、`--force` と `--as NAME` がそれぞれ `install_opts.force` と `install_opts.as` として渡されます。
 - `klua.commands.run`、`klua.commands.search`、`klua.commands.info`、`klua.commands.cleanup`、`klua.commands.doctor`、`klua.commands.remove` も、他のハンドラーと同じように再バインドできます。再ビルドは不要です。
 - `gh:` の解決は既定では API を使用せず、REST API の前に `releases.atom` へのフォールバックを試みます。検証済みのチェックサムとオプションの署名フックが展開の可否を決定します。これら 2 つのポリシーはベースラインの Lua 内にあり、置き換え可能です。
+- `klua versions` と `klua install --select` のリリース一覧も同じ順序に従います。`releases.atom`、次にリリース Web ページ、そして最後に `api.github.com` であるため、未認証の 1 時間 60 リクエスト制限を超えません。これらのコマンドを上書きするカスタムハンドラーも同じ優先順位を保つべきです。
+- `klua.commands.cleanup` は `~/.local/bin` のシンボリックリンクで現在有効なバージョンと `packages.lock.yaml` で固定されたバージョンを尊重し、本当に古い未保護のバージョンのみ削除します。`cleanup` をラップする場合もこの保護を維持してください。
 - 独立した HTTP リクエストには上限付きのバッチプリミティブを使用するため、`search`、`sync`、`upgrade` は無制限にスレッドを生成することなく高速に動作します。
 
 ## グローバル変数
 
 | 名前 | 型 | 意味 |
 | ---- | ---- | ------- |
-| `klua.version` | string | klua のバージョン（例: `"0.9.0"`） |
+| `klua.version` | string | klua のバージョン（例: `"0.9.1"`） |
 | `klua.paths` | table | `config`, `store`, `bin`, `cache`, `shards`, `init`, `packages`, `lock`, `taps`（絶対パスの文字列） |
 | `klua.providers` | table | スキーム -> `function(rest, target)` |
 | `klua.commands` | table | コマンド名 -> `function(args)`（終了コードを返す） |
@@ -31,7 +33,7 @@ klua でカスタマイズできるものはすべて `~/.config/klua/init.lua` 
 | `klua.registries` | array | エイリアスシャーディング用のレジストリベース URL（既定は公式レジストリ） |
 | `klua.shard_ttl` | number | レジストリシャードキャッシュの有効期間（秒、既定値 `3600`）。`0` で再利用を無効化 |
 | `klua.cli_flags` | table | `no_cache`, `skip_checksum`, `locked`, `lock`, `yes`, `latest`, `upgrade`, `dry_run`（ディスパッチ前に CLI スイッチから公開される） |
-| `klua.system` | table | システムパッケージ委譲の上書き: `manager`, `status`, `install` |
+| `klua.system` | table | システムパッケージ委譲の上書き: `manager`, `status`, `install`, `uninstall` |
 | `klua.lockfile` | table | パース済みの `packages.lock.yaml` の状態（`entries`, `loaded`）と `prune` などのヘルパー |
 | `klua.verify` | table | オプションの署名フック: `command`, `hook` |
 
@@ -99,6 +101,8 @@ local approved = klua.confirm("execute these remote commands? [y/N] ")
 
 `klua.prompt(prompt)` はプロンプトを表示し、前後の空白を除いた回答を返します。EOF の場合は `nil` を返します。`install --select` はこれで選択したリリースの番号を読み取り、回答がない場合は選択を中止します。
 
+v0.9.1 では既存の Lua シグネチャは変わりません。`klua.prompt`、`klua.confirm`、`klua.system` や `klua.lockfile` の各テーブル、および以下のプリミティブはすべて既存の動作を維持します。追加されたのは、[システムパッケージの委譲](#system-package-delegation)で説明する任意の `klua.system.uninstall` / `uninstall_cmd` フックだけです。新しい `.klua-links` スナップショット形式（`<link_name>=<relative_target_path>` の組）はベースラインが読み書きするため、カスタムハンドラーの変更は不要で、`=` のない旧形式も引き続き読み取られます。
+
 `install --dry-run` / `sync --dry-run` / `upgrade --dry-run` では `klua.cli_flags.dry_run` が true になります。ベースラインはこのフラグに基づき、ダウンロード、リンク、`sys:` コマンドの実行、ロックファイルへの書き込みの代わりに `dry-run: ...` の通知を出力します。カスタムハンドラーも、変更を伴う処理を追加する際は同じフラグを尊重すべきです。
 
 ## HTTP
@@ -160,25 +164,26 @@ local url_digest = klua.sha256_text("https://host/dir/tool.tar.gz")
 
 ベースラインは `sys:` およびマネージャー固有のスキーム（`apt:`, `apt-get:`, `dnf:`, `yum:`, `pacman:`, `apk:`, `brew:`）を実装しており、パッケージを 1 回のインストールバッチにキューイングします。キューイング前にステータスが確認され、重複する名前は除去されます。既定のマネージャーは実行時に利用可能なツールから検出されます。
 
-| マネージャー | ステータス確認 | インストールコマンド |
-| ------- | ------------ | --------------- |
-| `apt` | `dpkg-query -W -f='${Status}' <pkg>` | `apt-get install -y -- <pkgs>` |
-| `dnf` / `yum` | `rpm -q <pkg>` | `dnf install -y <pkgs>` / `yum install -y <pkgs>` |
-| `pacman` | `pacman -Q <pkg>` | `pacman -S --noconfirm -- <pkgs>` |
-| `apk` | `apk info -e <pkg>` | `apk add <pkgs>` |
-| `brew` | `brew list <pkg>` | `brew install <pkgs>` |
+| マネージャー | ステータス確認 | インストールコマンド | アンインストールコマンド |
+| ------- | ------------ | --------------- | ----------------- |
+| `apt` | `dpkg-query -W -f='${Status}' <pkg>` | `apt-get install -y -- <pkgs>` | `apt-get remove -y -- <pkgs>` |
+| `dnf` / `yum` | `rpm -q <pkg>` | `dnf install -y <pkgs>` / `yum install -y <pkgs>` | `dnf remove -y <pkgs>` / `yum remove -y <pkgs>` |
+| `pacman` | `pacman -Q <pkg>` | `pacman -S --noconfirm -- <pkgs>` | `pacman -R --noconfirm -- <pkgs>` |
+| `apk` | `apk info -e <pkg>` | `apk add <pkgs>` | `apk del <pkgs>` |
+| `brew` | `brew list <pkg>` | `brew install <pkgs>` | `brew uninstall <pkgs>` |
 
 すべてのコマンドはシングルクォートのエスケープ処理を経てシェルで実行されます。プロセスが root でない場合は `sudo` がバッチ全体に対して一度だけ付与されます（`brew` には付与されません）。`init.lua` でカスタマイズできます。
 
 ```lua
--- Option 1: choose a known manager (or any name when both hooks are supplied).
+-- オプション 1: 既知のマネージャーを選択（両方のフックを指定すれば任意の名前も可）。
 klua.system = {
     manager = "apt",
     status_cmd = "dpkg-query -W -f='${Status}' %s 2>/dev/null | grep -qx 'install ok installed'",
     install_cmd = "apt-get install -y -- %s",
+    uninstall_cmd = "apt-get remove -y -- %s",
 }
 
--- Option 2: full hooks. `install` receives the whole missing batch as an array.
+-- オプション 2: 完全なフック。`install` / `uninstall` はパッケージの配列を受け取ります。
 klua.system = {
     manager = "nix",
     status = function(pkg)
@@ -187,10 +192,15 @@ klua.system = {
     install = function(pkgs)
         return klua.exec("nix profile install nixpkgs#" .. table.concat(pkgs, " nixpkgs#"))
     end,
+    uninstall = function(pkgs)
+        return klua.exec("nix profile remove " .. table.concat(pkgs, " "))
+    end,
 }
 ```
 
-`status(pkg)` はインストール済みの場合に true（または数値の `0`）を返します。`install(pkgs)` は成功時に `0`/true を返します。どちらのフックも省略可能ですが、既知の実装がないカスタム `manager` 文字列では両方が必要です。マニフェストの `depends:` エントリのうち、スキームがないもの、またはシステムスキームのものは同じバッチを使用します。それ以外のターゲットは通常のプロバイダーにディスパッチされます。
+`status(pkg)` はインストール済みの場合に true（または数値の `0`）を返します。`install(pkgs)` と `uninstall(pkgs)` は成功時に `0`/true を返します。インストール用フックは省略可能ですが、既知の実装がないカスタム `manager` には少なくとも `status` と `install` が必要です。カスタムの削除経路には `uninstall` または `uninstall_cmd` が必要です。マニフェストの `depends:` エントリのうち、スキームがないもの、またはシステムスキームのものは同じインストールバッチを使用します。それ以外のターゲットは通常のプロバイダーにディスパッチされます。
+
+v0.9.1 以降、委譲に成功すると `~/.local/share/klua/store/sys/<manager>/<pkg>/` に軽量マーカーが記録されます。`klua list` には `sys:<pkg> (<manager>)` として表示され、`klua remove sys:<pkg>` は記録済みマネージャーのアンインストーラーを呼び出してマーカーを削除します。
 
 <a id="lockfile"></a>
 

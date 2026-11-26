@@ -18,7 +18,7 @@ your custom code before restoring the embedded baseline.
 Static Linux binaries (x86_64, arm64) and macOS binaries are attached to
 every `v*` release:
 
-[v0.9.0](https://github.com/kiru0414/klua/releases/download/v0.9.0/klua-v0.9.0-linux-x86_64.tar.gz)
+[v0.9.1](https://github.com/kiru0414/klua/releases/download/v0.9.1/klua-v0.9.1-linux-x86_64.tar.gz)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/kiru0414/klua/main/install.sh | bash
@@ -284,7 +284,15 @@ commands are prefixed with `sudo` automatically; `brew` is never elevated.
 ```sh
 klua install sys:git,curl,wget   # one batch; already-installed packages skipped
 klua install apt:jq              # force a particular manager scheme
+klua list                        # also lists sys:ffmpeg (apt) markers
+klua remove sys:ffmpeg           # uninstall via recorded manager; delete marker
 ```
+
+Delegated packages are tracked: every `sys:` / explicit-manager install writes
+a lightweight marker at `~/.local/share/klua/store/sys/<manager>/<pkg>/`, which
+`klua list` displays as `sys:ffmpeg (apt)`. `klua remove sys:<pkg>` invokes the
+recorded manager's uninstaller (with sudo for non-root Linux managers) and
+deletes the marker.
 
 The manager is detected at runtime from `dpkg-query`, `dnf`, `yum`, `pacman`,
 `apk` and `brew`. In `init.lua`, set `klua.system.manager` to override it, or
@@ -405,14 +413,17 @@ warning if release metadata cannot be fetched.
 ### cleanup / doctor
 
 ```sh
-klua cleanup        # keep newest version per package; remove stale links/caches
+klua cleanup        # remove old unprotected versions, stale links/caches
 klua doctor         # report dirs, PATH, registries, broken/shadowed links
 ```
 
 Version ordering is digit-aware (`1.10.0` is newer than `1.9.0`). `cleanup`
 removes old store versions, symlinks pointing to missing store files, library
-links, and the `downloads/` and `build/` caches. `doctor` exits `1` only for
-real errors (e.g. unwritable directories); warnings are informational.
+links, and the `downloads/` and `build/` caches — but it no longer prunes
+blindly: versions currently active via `~/.local/bin` symlinks and versions
+pinned in `packages.lock.yaml` are protected, and only genuinely old,
+unprotected versions are removed. `doctor` exits `1` only for real errors
+(e.g. unwritable directories); warnings are informational.
 
 ### add / sync
 
@@ -462,19 +473,25 @@ newly resolved versions. `outdated` is read-only: it compares installed
 klua install rg@14.0.0       # resolve the alias, then pin that release
 klua install --select jq     # numbered release menu; requires TTY/stdin
 klua versions jq             # list releases; mark installed/active/pinned
-klua use jq@jq-1.7.1         # instant OFFLINE relink to an installed version
+klua use jq@jq-1.7.1         # instant OFFLINE relink; keeps --as names
 klua remove jq@jq-1.7.1      # remove one version, relink the newest
 ```
 
 `@VERSION` pins work for bare aliases as well as scheme targets. `versions`
-lists available releases from the GitHub/GitLab API, marking installed, active
-and pinned versions; when the API is unavailable it falls back to locally
-installed versions. `--select` prints a numbered menu and installs the pinned
-version for the index you enter (a missing TTY/stdin answer cancels). `use` is
-fully offline — no download, API call or store extraction — and reuses the
-exact link set recorded at install time, falling back to executable discovery
-only when no snapshot exists. `remove` with `@version` deletes just that
-stored version and relinks the newest remaining one; removing the last version
+lists available releases, marking installed, active and pinned versions;
+GitHub discovery tries `releases.atom` first, then the releases web page, and
+only calls `api.github.com` as a last resort, avoiding the 60-request/hour
+unauthenticated API limit. `install --select` uses that same API-free path for
+its numbered menu and installs the pinned version for the index you enter (a
+missing TTY/stdin answer cancels). GitLab releases still use the GitLab API;
+if all sources fail, `versions` falls back to locally installed versions. `use`
+is fully offline — no download, API call or store extraction — and reuses the
+exact link set recorded at install time. `.klua-links` snapshots now store
+`<link_name>=<relative_target_path>` pairs, so a custom name from
+`klua install --as jq2 ...` survives version switches (legacy snapshots
+without `=` are still understood); executable discovery is only a fallback
+when no snapshot exists. `remove` with `@version` deletes just that stored
+version and relinks the newest remaining one; removing the last version
 prunes symlinks and package/lock entries as before and drops a stale
 `--locked` pin for the removed version.
 
@@ -484,8 +501,11 @@ prunes symlinks and package/lock entries as before and drops a stale
 klua tap add https://example.com/my-registry
 klua tap list
 klua tap remove https://example.com/my-registry
-klua list                        # provider:user/repo  version, from the store
+klua list                        # provider:user/repo version; sys markers too
 ```
+
+Alongside store packages, `klua list` shows tracked system delegation entries
+such as `sys:ffmpeg (apt)`; use `klua remove sys:ffmpeg` to uninstall them.
 
 ### remove / rm / uninstall
 

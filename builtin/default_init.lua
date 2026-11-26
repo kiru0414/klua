@@ -2126,43 +2126,99 @@ local SYSTEM_MANAGERS = {
         end,
         install = "apt-get install -y -- %s",
         install_bin = "apt-get",
+        uninstall = "apt-get remove -y -- %s",
     },
     dnf = {
         probe = "dnf",
         status = function(pkg) return "rpm -q " .. shq(pkg) .. " >/dev/null 2>&1" end,
         install = "dnf install -y %s",
         install_bin = "dnf",
+        uninstall = "dnf remove -y %s",
     },
     yum = {
         probe = "yum",
         status = function(pkg) return "rpm -q " .. shq(pkg) .. " >/dev/null 2>&1" end,
         install = "yum install -y %s",
         install_bin = "yum",
+        uninstall = "yum remove -y %s",
     },
     pacman = {
         probe = "pacman",
         status = function(pkg) return "pacman -Q " .. shq(pkg) .. " >/dev/null 2>&1" end,
         install = "pacman -S --noconfirm -- %s",
         install_bin = "pacman",
+        uninstall = "pacman -R --noconfirm -- %s",
     },
     apk = {
         probe = "apk",
         status = function(pkg) return "apk info -e " .. shq(pkg) .. " >/dev/null 2>&1" end,
         install = "apk add %s",
         install_bin = "apk",
+        uninstall = "apk del %s",
     },
     brew = {
         probe = "brew",
         status = function(pkg) return "brew list " .. shq(pkg) .. " >/dev/null 2>&1" end,
         install = "brew install %s",
         install_bin = "brew",
+        uninstall = "brew uninstall %s",
     },
 }
 -- `apt-get:` targets and explicit manager overrides share the apt spec.
 SYSTEM_MANAGERS["apt-get"] = SYSTEM_MANAGERS.apt
 
+local function canonical_system_manager(name)
+    if name == "apt-get" then
+        return "apt"
+    end
+    return name
+end
+
 local system_queue = {}
 local system_seen = {}
+
+-- System packages are tracked with a lightweight store marker so `list` and
+-- `remove` can treat delegated packages like any other klua-managed package.
+local function system_marker_dir(manager, pkg)
+    return klua.paths.store .. "/sys/" .. canonical_system_manager(manager) .. "/" .. pkg
+end
+
+local function record_system_marker(manager, pkg)
+    local dir = system_marker_dir(manager, pkg)
+    if klua.is_dir(dir) then
+        return true
+    end
+    if not klua.mkdir(dir) then
+        klua.warn("could not create system marker " .. dir)
+        return false
+    end
+    local body = "manager: " .. canonical_system_manager(manager)
+        .. "\npackage: " .. pkg .. "\n"
+    if not klua.write_file(dir .. "/.klua-system", body) then
+        klua.warn("could not write system marker in " .. dir)
+        return false
+    end
+    return true
+end
+
+-- All recorded markers for a package, across managers. A package can legally
+-- appear under more than one manager on a machine, so removal handles each.
+local function system_marker_entries(pkg)
+    local entries = {}
+    local sys_root = klua.paths.store .. "/sys"
+    for _, manager in ipairs(klua.list_dir(sys_root)) do
+        if manager.is_dir then
+            local marker = system_marker_dir(manager.name, pkg)
+            if klua.is_dir(marker) then
+                entries[#entries + 1] = {
+                    manager = canonical_system_manager(manager.name),
+                    dir = marker,
+                }
+            end
+        end
+    end
+    return entries
+end
 
 local function detect_system_manager()
     local configured = klua.system.manager
@@ -2239,8 +2295,90 @@ local function sudo_prefix(manager)
     if klua.exec("command -v sudo >/dev/null 2>&1") == 0 then
         return "sudo "
     end
-    klua.warn("not root and sudo is unavailable; system install may fail")
+    klua.warn("not root and sudo is unavailable; system operation may fail")
     return ""
+end
+
+local function system_uninstall_command(manager, packages)
+    if type(klua.system.uninstall) == "function" then
+        return nil
+    end
+    if type(klua.system.uninstall_cmd) == "string" then
+        local quoted = {}
+        for _, pkg in ipairs(packages) do
+            quoted[#quoted + 1] = shq(pkg)
+        end
+        return string.format(klua.system.uninstall_cmd, table.concat(quoted, " "))
+    end
+    local spec = SYSTEM_MANAGERS[manager]
+    if not spec or not spec.uninstall then
+        return nil
+    end
+    local quoted = {}
+    for _, pkg in ipairs(packages) do
+        quoted[#quoted + 1] = shq(pkg)
+    end
+    local prefix = sudo_prefix(manager)
+    if spec.install_bin and klua.exec("command -v " .. spec.install_bin .. " >/dev/null 2>&1") ~= 0 then
+        return nil
+    end
+    return prefix .. string.format(spec.uninstall, table.concat(quoted, " "))
+end
+
+-- Remove tracked system packages. Returns an exit code; each marker is removed
+-- only after its manager confirms the uninstall succeeded.
+local function uninstall_system_packages(rest)
+    local packages = parse_system_packages(rest)
+    if not packages then
+        return 1
+    end
+    local status = 0
+    for _, pkg in ipairs(packages) do
+        local markers = system_marker_entries(pkg)
+        if #markers == 0 then
+            klua.error("package not installed: sys:" .. pkg)
+            status = 1
+        else
+            for _, marker in ipairs(markers) do
+                local command = system_uninstall_command(marker.manager, { pkg })
+                if dry_run() then
+                    if command then
+                        dry_run_notice("would run: " .. command)
+                    else
+                        dry_run_notice("would call the configured system uninstaller for: " .. pkg)
+                    end
+                else
+                    local code
+                    if type(klua.system.uninstall) == "function" then
+                        local result = klua.system.uninstall({ pkg })
+                        code = result == true and 0 or (type(result) == "number" and result or 1)
+                    elseif type(klua.system.uninstall_cmd) == "string" then
+                        code = klua.exec(string.format(klua.system.uninstall_cmd, shq(pkg)))
+                    elseif command then
+                        klua.info("sys: " .. command)
+                        code = klua.exec(command)
+                    else
+                        klua.error("no uninstaller available for " .. marker.manager)
+                        code = 1
+                    end
+                    if code ~= 0 then
+                        klua.error("sys: failed to remove " .. pkg .. " with " .. marker.manager)
+                        status = 1
+                    else
+                        local ok, err = klua.remove(marker.dir)
+                        if not ok then
+                            klua.error("could not remove system marker " .. marker.dir
+                                .. ": " .. tostring(err))
+                            status = 1
+                        else
+                            klua.info("removed sys:" .. pkg .. " (" .. marker.manager .. ")")
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return status
 end
 
 -- Build the exact command a manager would run. Returns nil for a custom Lua
@@ -2308,12 +2446,18 @@ local function install_system_batch(manager, packages)
     return klua.exec(command)
 end
 
-local function queue_system_packages(packages)
+local function queue_system_packages(packages, explicit_manager)
     local added = 0
+    local manager = explicit_manager and canonical_system_manager(explicit_manager) or nil
     for _, pkg in ipairs(packages) do
-        if not system_seen[pkg] then
-            system_seen[pkg] = true
-            system_queue[#system_queue + 1] = pkg
+        if system_seen[pkg] then
+            local entry = system_queue[system_seen[pkg]]
+            if not entry.manager and manager then
+                entry.manager = manager
+            end
+        else
+            system_seen[pkg] = #system_queue + 1
+            system_queue[#system_queue + 1] = { pkg = pkg, manager = manager }
             added = added + 1
         end
     end
@@ -2326,60 +2470,96 @@ flush_system_packages = function()
     end
     local queued = system_queue
     system_queue = {}
-    local manager = detect_system_manager()
-    if not manager then
-        return 1
+    system_seen = {}
+
+    local detected
+    for _, entry in ipairs(queued) do
+        if not entry.manager then
+            if not detected then
+                detected = detect_system_manager()
+                if not detected then
+                    return 1
+                end
+            end
+            entry.manager = canonical_system_manager(detected)
+        end
     end
 
-    local missing = {}
-    for _, pkg in ipairs(queued) do
-        if system_package_installed(manager, pkg) then
-            klua.info("sys: '" .. pkg .. "' is already installed")
+    -- Explicit manager schemes are kept separate instead of being batched into
+    -- one detected manager command.
+    local groups, order = {}, {}
+    for _, entry in ipairs(queued) do
+        if not groups[entry.manager] then
+            groups[entry.manager] = {}
+            order[#order + 1] = entry.manager
+        end
+        local group = groups[entry.manager]
+        group[#group + 1] = entry.pkg
+    end
+
+    local status = 0
+    for _, manager in ipairs(order) do
+        local packages = groups[manager]
+        local missing, confirmed = {}, {}
+        for _, pkg in ipairs(packages) do
+            if system_package_installed(manager, pkg) then
+                klua.info("sys: '" .. pkg .. "' is already installed")
+                confirmed[pkg] = true
+            else
+                missing[#missing + 1] = pkg
+            end
+        end
+
+        if #missing == 0 then
+            klua.info("sys: all " .. #packages .. " requested package(s) are already installed")
         else
-            missing[#missing + 1] = pkg
+            if dry_run() then
+                dry_run_notice("would install " .. #missing .. " missing package(s) with "
+                    .. manager .. ": " .. table.concat(missing, ", "))
+            else
+                klua.info("sys: installing " .. #missing .. " missing package(s) with "
+                    .. manager .. ": " .. table.concat(missing, ", "))
+            end
+            if install_system_batch(manager, missing) ~= 0 then
+                klua.error("sys: failed to install package(s): " .. table.concat(missing, ", "))
+                status = 1
+            elseif dry_run() then
+                -- Preview only: no marker or package state is changed.
+            else
+                local failed = {}
+                for _, pkg in ipairs(missing) do
+                    if not system_package_installed(manager, pkg) then
+                        failed[#failed + 1] = pkg
+                    else
+                        confirmed[pkg] = true
+                    end
+                end
+                if #failed > 0 then
+                    klua.warn("sys: package(s) still not available after install: "
+                        .. table.concat(failed, ", "))
+                    status = 1
+                else
+                    klua.info("sys: installed " .. #missing .. " package(s)")
+                end
+            end
+        end
+
+        if not dry_run() then
+            for pkg in pairs(confirmed) do
+                record_system_marker(manager, pkg)
+            end
         end
     end
-
-    if #missing == 0 then
-        klua.info("sys: all " .. #queued .. " requested package(s) are already installed")
-        return 0
-    end
-
-    if dry_run() then
-        dry_run_notice("would install " .. #missing .. " missing package(s) with " .. manager
-            .. ": " .. table.concat(missing, ", "))
-    else
-        klua.info("sys: installing " .. #missing .. " missing package(s) with " .. manager
-            .. ": " .. table.concat(missing, ", "))
-    end
-    if install_system_batch(manager, missing) ~= 0 then
-        klua.error("sys: failed to install package(s): " .. table.concat(missing, ", "))
-        return 1
-    end
-    if dry_run() then
-        return 0
-    end
-
-    local failed = {}
-    for _, pkg in ipairs(missing) do
-        if not system_package_installed(manager, pkg) then
-            failed[#failed + 1] = pkg
-        end
-    end
-    if #failed > 0 then
-        klua.warn("sys: package(s) still not available after install: " .. table.concat(failed, ", "))
-        return 1
-    end
-    klua.info("sys: installed " .. #missing .. " package(s)")
-    return 0
+    return status
 end
 
-local function system_install(rest)
+local function system_install(rest, target)
     local packages = parse_system_packages(rest)
     if not packages then
         return 1
     end
-    queue_system_packages(packages)
+    local scheme = string.match(target or "", "^([%w][%w+_-]*):")
+    queue_system_packages(packages, scheme ~= "sys" and scheme or nil)
     return 0
 end
 
@@ -2498,19 +2678,42 @@ local function installed_packages()
     local result = {}
     for _, provider in ipairs(klua.list_dir(klua.paths.store)) do
         if provider.is_dir then
-            for _, user in ipairs(klua.list_dir(provider.path)) do
-                if user.is_dir then
-                    for _, repo in ipairs(klua.list_dir(user.path)) do
-                        if repo.is_dir then
-                            for _, version in ipairs(klua.list_dir(repo.path)) do
-                                if version.is_dir then
-                                    result[#result + 1] = {
-                                        provider = provider.name,
-                                        user = user.name,
-                                        repo = repo.name,
-                                        version = version.name,
-                                        target = provider.name .. ":" .. user.name .. "/" .. repo.name,
-                                    }
+            if provider.name == "sys" then
+                -- Delegated packages use a lightweight marker directory instead
+                -- of version directories.
+                for _, manager in ipairs(klua.list_dir(provider.path)) do
+                    if manager.is_dir then
+                        for _, pkg in ipairs(klua.list_dir(manager.path)) do
+                            if pkg.is_dir then
+                                result[#result + 1] = {
+                                    provider = "sys",
+                                    user = canonical_system_manager(manager.name),
+                                    manager = canonical_system_manager(manager.name),
+                                    repo = pkg.name,
+                                    version = "",
+                                    target = "sys:" .. pkg.name,
+                                    system = true,
+                                }
+                            end
+                        end
+                    end
+                end
+            else
+                for _, user in ipairs(klua.list_dir(provider.path)) do
+                    if user.is_dir then
+                        for _, repo in ipairs(klua.list_dir(user.path)) do
+                            if repo.is_dir then
+                                for _, version in ipairs(klua.list_dir(repo.path)) do
+                                    if version.is_dir then
+                                        result[#result + 1] = {
+                                            provider = provider.name,
+                                            user = user.name,
+                                            repo = repo.name,
+                                            version = version.name,
+                                            target = provider.name .. ":" .. user.name
+                                                .. "/" .. repo.name,
+                                        }
+                                    end
                                 end
                             end
                         end
@@ -2832,7 +3035,83 @@ klua.lockfile.prune = prune_lockfile
 -- Release listing, pinning and offline switching (v0.9.0)
 -- ---------------------------------------------------------------------------
 
+-- Listing releases must not spend the unauthenticated REST quota. GitHub's
+-- Atom feed and releases page expose the tags without an API call; the REST
+-- endpoint is only a last resort when both scrapes fail.
+local function release_tags_from_html(body)
+    local tags, seen = {}, {}
+    for href in string.gmatch(body, [=[href=["']([^"']+)["']]=]) do
+        local tag = tag_from_location(html_unescape(href))
+        if tag and not seen[tag] then
+            seen[tag] = true
+            tags[#tags + 1] = tag
+        end
+    end
+    return tags
+end
+
+local function github_atom_release_versions(user, name)
+    local web = strip_trailing_slash(klua.github_web)
+    local url = web .. "/" .. user .. "/" .. name .. "/releases.atom"
+    local body, status, err = klua.http_get(url)
+    if err or status ~= 200 then
+        return nil, "could not fetch " .. url .. ": "
+            .. tostring(err or ("HTTP " .. tostring(status)))
+    end
+
+    local tags, seen = {}, {}
+    for entry in string.gmatch(body, "<entry[^>]*>(.-)</entry>") do
+        local tag
+        for href in string.gmatch(entry, [=[href=["']([^"']+)["']]=]) do
+            tag = tag_from_location(html_unescape(href))
+            if tag then
+                break
+            end
+        end
+        if not tag then
+            local title = string.match(entry, "<title[^>]*>(.-)</title>")
+            if title then
+                title = html_unescape(string.match(title, "^%s*(.-)%s*$"))
+                if title ~= "" then
+                    tag = title
+                end
+            end
+        end
+        if tag and not seen[tag] then
+            seen[tag] = true
+            tags[#tags + 1] = tag
+        end
+    end
+    if #tags == 0 then
+        return nil, "no release entries in " .. url
+    end
+    return tags
+end
+
+local function github_web_release_versions(user, name)
+    local web = strip_trailing_slash(klua.github_web)
+    local url = web .. "/" .. user .. "/" .. name .. "/releases"
+    local body, status, err = klua.http_get(url)
+    if err or status ~= 200 then
+        return nil, "could not fetch " .. url .. ": "
+            .. tostring(err or ("HTTP " .. tostring(status)))
+    end
+    local tags = release_tags_from_html(body)
+    if #tags == 0 then
+        return nil, "no release tags in " .. url
+    end
+    return tags
+end
+
 local function github_release_versions(user, name)
+    local versions, scrape_err = github_atom_release_versions(user, name)
+    if not versions then
+        versions, scrape_err = github_web_release_versions(user, name)
+    end
+    if versions then
+        return versions
+    end
+
     local api = klua.github_api .. "/repos/" .. user .. "/" .. name
         .. "/releases?per_page=100"
     local body, status, err = klua.http_get(api)
@@ -2841,12 +3120,13 @@ local function github_release_versions(user, name)
     end
     if status ~= 200 then
         return nil, "GitHub API returned HTTP " .. tostring(status)
+            .. " (after " .. tostring(scrape_err) .. ")"
     end
     local releases, json_err = klua.json_parse(body)
     if type(releases) ~= "table" then
         return nil, "could not parse release JSON: " .. tostring(json_err)
     end
-    local versions = {}
+    versions = {}
     for _, release in ipairs(releases) do
         if type(release) == "table" then
             local tag = release.tag_name or release.name
@@ -2950,7 +3230,9 @@ save_link_snapshot = function(store_dir)
                 if full == base or string.sub(full, 1, #base + 1) == base .. "/" then
                     local relative = string.sub(full, #base + 2)
                     if relative ~= "" then
-                        lines[#lines + 1] = relative
+                        -- Store the link name as well: `install --as jq2` must
+                        -- survive a later `use` switch to another version.
+                        lines[#lines + 1] = entry.name .. "=" .. relative
                     end
                 end
             end
@@ -3000,9 +3282,13 @@ local function relink_version(scheme, repo, version)
     local code = 0
     local snapshot = klua.read_file(store_dir .. "/.klua-links")
     if snapshot and snapshot ~= "" then
-        for relative in string.gmatch(snapshot, "[^\r\n]+") do
+        for line in string.gmatch(snapshot, "[^\r\n]+") do
+            local name, relative = string.match(line, "^([^=]+)=(.+)$")
+            if not name then
+                -- Legacy v0.9.0 snapshots stored only the relative target.
+                name, relative = basename(line), line
+            end
             local target = store_dir .. "/" .. relative
-            local name = basename(relative)
             if not klua.file_exists(target) then
                 klua.warn("saved link target is missing: " .. target)
             elseif not safe_link(target, klua.paths.bin .. "/" .. name, name) then
@@ -3316,7 +3602,19 @@ function klua.commands.remove(args)
             end
         end
 
-        if scheme then
+        if scheme and SYSTEM_SCHEMES[scheme] then
+            local code = uninstall_system_packages(rest)
+            if code ~= 0 then
+                status = 1
+            else
+                local names = parse_system_packages(rest) or {}
+                for _, pkg in ipairs(names) do
+                    removed["sys:" .. pkg] = true
+                    removed[scheme .. ":" .. pkg] = true
+                    removed[resolved] = true
+                end
+            end
+        elseif scheme then
             local base = store_path_for(scheme, rest)
             local repo, requested_version = split_at_tag(rest)
             if not base or not klua.file_exists(base) then
@@ -3881,9 +4179,52 @@ end
 -- klua cleanup
 -- ---------------------------------------------------------------------------
 
+-- A non-latest version is still in use when any ~/.local/bin symlink points
+-- into its store directory. `use` deliberately creates that situation, so
+-- cleanup must not treat "oldest" as "disposable".
+local function version_has_active_link(path)
+    local prefix = normalize_dir(path)
+    for _, entry in ipairs(klua.list_dir(klua.paths.bin)) do
+        if not entry.is_dir and klua.file_exists(entry.path) then
+            local target = klua.readlink(entry.path)
+            if target then
+                local full = normalize_dir(target)
+                if full == prefix or string.sub(full, 1, #prefix + 1) == prefix .. "/" then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function pinned_version_paths()
+    local paths = {}
+    if not klua.file_exists(klua.paths.lock) then
+        return paths
+    end
+    if not load_lockfile() then
+        return paths
+    end
+    for key, entry in pairs(klua.lockfile.entries) do
+        if type(entry) == "table" and type(entry.version) == "string"
+            and entry.version ~= "" then
+            local scheme, user, repo = string.match(key,
+                "^([%w][%w+_-]*):([^/@]+)/([^/@]+)")
+            if scheme and user and repo then
+                paths[normalize_dir(klua.paths.store .. "/" .. scheme .. "/"
+                    .. user .. "/" .. repo .. "/" .. entry.version)] = true
+            end
+        end
+    end
+    return paths
+end
+
 function klua.commands.cleanup(args)
-    local removed_versions, broken_links, library_links, cache_removed = 0, 0, 0, 0
+    local removed_versions, kept_versions = 0, 0
+    local broken_links, library_links, cache_removed = 0, 0, 0
     local status = 0
+    local pinned = pinned_version_paths()
 
     for _, provider in ipairs(klua.list_dir(klua.paths.store)) do
         if provider.is_dir then
@@ -3893,14 +4234,20 @@ function klua.commands.cleanup(args)
                         if repo.is_dir then
                             local versions = sorted_versions(klua.list_dir(repo.path))
                             for index = 1, #versions - 1 do
-                                local ok, err = klua.remove(versions[index].path)
-                                if ok then
-                                    removed_versions = removed_versions + 1
-                                    klua.info("removed old version " .. versions[index].path)
+                                local version_path = normalize_dir(versions[index].path)
+                                if pinned[version_path] or version_has_active_link(version_path) then
+                                    kept_versions = kept_versions + 1
+                                    klua.info("kept protected version " .. versions[index].path)
                                 else
-                                    klua.error("could not remove " .. versions[index].path
-                                        .. ": " .. tostring(err))
-                                    status = 1
+                                    local ok, err = klua.remove(versions[index].path)
+                                    if ok then
+                                        removed_versions = removed_versions + 1
+                                        klua.info("removed old version " .. versions[index].path)
+                                    else
+                                        klua.error("could not remove " .. versions[index].path
+                                            .. ": " .. tostring(err))
+                                        status = 1
+                                    end
                                 end
                             end
                         end
@@ -3948,6 +4295,7 @@ function klua.commands.cleanup(args)
     end
 
     klua.info("cleanup: " .. removed_versions .. " old version(s), "
+        .. kept_versions .. " protected version(s) kept, "
         .. broken_links .. " broken link(s), " .. library_links
         .. " library link(s), " .. cache_removed .. " cache dir(s) removed")
     return status
@@ -4454,8 +4802,12 @@ function klua.commands.list(args)
         return 0
     end
     for _, package in ipairs(packages) do
-        klua.info(package.provider .. ":" .. package.user .. "/" .. package.repo
-            .. "  " .. package.version)
+        if package.system then
+            klua.info("sys:" .. package.repo .. " (" .. package.manager .. ")")
+        else
+            klua.info(package.provider .. ":" .. package.user .. "/" .. package.repo
+                .. "  " .. package.version)
+        end
     end
     return 0
 end

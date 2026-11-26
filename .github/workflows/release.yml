@@ -19,6 +19,9 @@ jobs:
           - os: ubuntu-24.04
             artifact: linux-x86_64
             static: true
+          - os: macos-15
+            artifact: macos-arm64
+            static: false
 
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +36,12 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           -DCMAKE_EXE_LINKER_FLAGS=-static
           -DOPENSSL_USE_STATIC_LIBS=ON
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
 
       - name: Build
         run: cmake --build build -j 4

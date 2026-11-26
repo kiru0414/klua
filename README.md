@@ -64,8 +64,9 @@ curl -fsSL https://raw.githubusercontent.com/kiru0414/klua/main/install.sh | bas
 
 Milestones 1, 2 and 3 plus the v0.4.0 safety release, the v0.5.0
 resolution/verification release, the v0.6.0 delegation/reproducibility
-release, the v0.7.0 performance/resilience release and the v0.8.0 safety and
-preview release are implemented:
+release, the v0.7.0 performance/resilience release, the v0.8.0 safety and
+preview release, the v0.9.0 version-selection release and the v0.9.1
+tracking/lifecycle release are implemented:
 
 **Milestone 1 — core skeleton**
 
@@ -211,6 +212,26 @@ preview release are implemented:
   template; a Lua `klua.verify.hook(context)` may inspect or reject the payload
   directly. Verification fails closed.
 
+**v0.9.1 — system tracking, API-free version discovery & safer lifecycle**
+
+- System-delegated packages are now tracked. Installing `sys:<pkg>` or an
+  explicit manager scheme (`apt:`, `apt-get:`, `dnf:`, `yum:`, `pacman:`,
+  `apk:`, `brew:`) records a lightweight marker at
+  `~/.local/share/klua/store/sys/<manager>/<pkg>/`. `klua list` shows entries
+  such as `sys:ffmpeg (apt)`. `klua remove sys:<pkg>` unifies removal by
+  invoking the recorded manager's uninstaller (with sudo for non-root Linux
+  managers) and deleting the marker.
+- `klua versions` and `klua install --select` discover GitHub releases without
+  touching the REST API first: they try `releases.atom`, then the releases web
+  page, and only fall back to `api.github.com` if both fail. This avoids the
+  60-request/hour unauthenticated API limit.
+- `.klua-links` snapshots now store `<link_name>=<relative_target_path>` pairs,
+  so `klua install --as jq2 ...` keeps the custom `jq2` name when switching
+  versions with `klua use`. Legacy snapshots without `=` are still understood.
+- `klua cleanup` no longer deletes non-latest versions blindly: it protects
+  versions currently active via `~/.local/bin` symlinks and versions pinned in
+  `packages.lock.yaml`, while still removing genuinely old unprotected ones.
+
 **v0.9.0 — version selection & offline switching**
 
 - `klua install --dry-run <target>` now prints a clean preview: the resolved
@@ -276,6 +297,7 @@ bash tests/test_v05.sh          # offline: API-free GitHub, shard cache, SHA-256
 bash tests/test_v06.sh          # offline: sys batching, tokens, lockfiles
 bash tests/test_v07.sh          # offline: parallel batches, 3-tier fallback, TOFU, verify
 bash tests/test_v08.sh          # offline: approvals, pruning, run refresh, outdated, dry-run
+bash tests/test_v091.sh         # offline: sys tracking, API-free versions, snapshots, cleanup
 ```
 
 ## Building (Linux / macOS)
@@ -305,15 +327,16 @@ klua install gh:jqlang/jq     # direct GitHub Releases install
 klua i gh:jqlang/jq@jq-1.7.1  # pinned tag
 klua install rg@14.0.0       # pin a release through an alias
 klua install --dry-run fd    # preview resolved package, version, sys commands
-klua install --select jq     # choose a release from a numbered menu (TTY)
-klua versions jq             # list releases; mark installed/active/pinned
-klua use jq@jq-1.7.1         # offline relink to an installed version
+klua install --select jq     # numbered release menu; Atom/web first, API last
+klua versions jq             # list releases Atom/web-first; mark installed/active/pinned
+klua use jq@jq-1.7.1         # offline relink; preserves --as link names
 klua install --force git      # override shadowing/protected-command guard
-klua install --as jq2 jq      # link the primary binary as ~/.local/bin/jq2
+klua install --as jq2 jq      # link as ~/.local/bin/jq2; name survives klua use
 klua install --no-cache fd    # refetch the registry shard instead of using cache
 klua install --skip-checksum jq  # bypass SHA-256 verification (explicit)
 klua install --yes gh:user/repo  # approve remote build.steps / verify commands
 klua install sys:git,curl     # skip installed packages; batch the rest
+klua install sys:ffmpeg       # delegate and record a lightweight sys marker
 klua sync --lock              # write versions, URLs and digests to the lockfile
 klua sync --locked            # reproduce exactly; abort on any hash mismatch
 klua sync --dry-run           # preview packages and sys commands; change nothing
@@ -324,7 +347,7 @@ klua run --latest gh:user/repo # alias for --upgrade
 klua outdated                 # list installed gh/gl packages with newer releases
 klua search jq                # search alias shards across all registries
 klua info jq                  # resolution, versions, links, release metadata
-klua cleanup                  # prune old versions, broken links and caches
+klua cleanup                  # prune old unprotected versions; keep active/locked ones
 klua doctor                   # diagnose dirs, PATH, registries, links
 klua add gh:jqlang/jq fd      # record targets in packages.yaml
 klua sync                     # install everything in packages.yaml
@@ -332,10 +355,11 @@ klua sync https://host/dotfiles.yaml  # remote source, follows includes:
 klua upgrade --dry-run        # preview version changes and sys commands
 klua upgrade                  # upgrade all installed packages
 klua remove fd                # delete links, store dir, packages.yaml + lock entries
+klua remove sys:ffmpeg        # uninstall via recorded manager (sudo on Linux); drop marker
 klua remove jq@jq-1.7.1       # remove one version; relink the newest
 klua rm gh:jqlang/jq          # alias of remove
 klua uninstall url:https://host/tool.tar.gz  # alias of remove
-klua list                     # installed packages from the store
+klua list                     # store packages + sys:<pkg> (<manager>) markers
 klua init-manifest            # starter klua.yaml for a package repo
 klua repair                   # back up and restore a clean init.lua
 klua repair --dry-run         # preview backup path and diff, change nothing

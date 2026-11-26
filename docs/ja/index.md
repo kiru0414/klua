@@ -37,7 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/kiru0414/klua/main/install.sh | bas
 
 ## ステータス
 
-マイルストーン 1、2、3 に加え、v0.4.0 の安全性リリース、v0.5.0 の解決／検証リリース、v0.6.0 の委譲／再現性リリース、v0.7.0 のパフォーマンス／耐障害性リリース、v0.8.0 の安全性とプレビューのリリースが実装済みです：
+マイルストーン 1、2、3 に加え、v0.4.0 の安全性リリース、v0.5.0 の解決／検証リリース、v0.6.0 の委譲／再現性リリース、v0.7.0 のパフォーマンス／耐障害性リリース、v0.8.0 の安全性とプレビューのリリース、v0.9.0 のバージョン選択リリース、v0.9.1 の追跡／ライフサイクルリリースが実装済みです：
 
 **マイルストーン 1 — コアスケルトン**
 
@@ -97,6 +97,13 @@ curl -fsSL https://raw.githubusercontent.com/kiru0414/klua/main/install.sh | bas
 - `packages.lock.yaml` は trust-on-first-use のピンとして強制されます。`sync --locked` はダウンロードしたアセットを再ハッシュし、不一致があれば中止するため、上流での黙々とした改ざんを防ぎます。`--locked` は `--skip-checksum` と併用できません。
 - 任意の `verify:` コマンド（`klua.yaml` 内、または `init.lua` の `klua.verify.command`）は、チェックサム検証後、展開前に実行されます。コマンドテンプレートには `{payload}`、`{asset}`、`{version}`、`{target}`、`{sha256}` を埋め込めます。Lua の `klua.verify.hook(context)` でペイロードを直接検査・拒否することもできます。検証は fail-close（失敗時は拒否）で動作します。
 
+**v0.9.1 — システムパッケージの追跡、API を使わないバージョン探索、安全なライフサイクル**
+
+- `sys:<pkg>` や明示的なマネージャースキーム（`apt:`、`apt-get:`、`dnf:`、`yum:`、`pacman:`、`apk:`、`brew:`）でのインストールは、`~/.local/share/klua/store/sys/<manager>/<pkg>/` に軽量マーカーを記録するようになりました。`klua list` には `sys:ffmpeg (apt)` のように表示され、`klua remove sys:<pkg>` は記録済みマネージャーのアンインストーラー（Linux の非 root では sudo 付き）を呼び出してマーカーを削除します。
+- `klua versions` と `klua install --select` は GitHub リリースを `releases.atom`、次にリリース Web ページから探索し、両方失敗した場合のみ `api.github.com` にフォールバックします。未認証の 1 時間 60 リクエスト制限を回避できます。
+- `.klua-links` スナップショットは `<link_name>=<relative_target_path>` の組を保存するため、`klua install --as jq2 ...` のカスタム名が `klua use` での切り替え後も保持されます。`=` のない旧形式も引き続き読み取れます。
+- `klua cleanup` は非最新バージョンを闇雲に削除しなくなりました。`~/.local/bin` のシンボリックリンクで有効なバージョンと `packages.lock.yaml` で固定されたバージョンを保護し、本当に古い未保護のバージョンのみ削除します。
+
 **v0.9.0 — バージョン選択とオフライン切り替え**
 
 - `klua install --dry-run <target>` は、解決されたパッケージ、バージョン、予定される `sys:` コマンドを整理して表示します。ストア、リンク、ロックファイルは一切変更しません。
@@ -131,6 +138,7 @@ bash tests/test_v05.sh          # offline: API-free GitHub, shard cache, SHA-256
 bash tests/test_v06.sh          # offline: sys batching, tokens, lockfiles
 bash tests/test_v07.sh          # offline: parallel batches, 3-tier fallback, TOFU, verify
 bash tests/test_v08.sh          # offline: approvals, pruning, run refresh, outdated, dry-run
+bash tests/test_v091.sh         # offline: sys tracking, API-free versions, snapshots, cleanup
 ```
 
 ## ビルド（Linux / macOS）
@@ -158,15 +166,16 @@ klua install gh:jqlang/jq     # direct GitHub Releases install
 klua i gh:jqlang/jq@jq-1.7.1  # pinned tag
 klua install rg@14.0.0       # pin a release through an alias
 klua install --dry-run fd    # preview resolved package, version, sys commands
-klua install --select jq     # choose a release from a numbered menu (TTY)
-klua versions jq             # list releases; mark installed/active/pinned
-klua use jq@jq-1.7.1         # offline relink to an installed version
+klua install --select jq     # numbered release menu; Atom/web first, API last
+klua versions jq             # list releases Atom/web-first; mark installed/active/pinned
+klua use jq@jq-1.7.1         # offline relink; preserves --as link names
 klua install --force git      # override shadowing/protected-command guard
-klua install --as jq2 jq      # link the primary binary as ~/.local/bin/jq2
+klua install --as jq2 jq      # link as ~/.local/bin/jq2; name survives klua use
 klua install --no-cache fd    # refetch the registry shard instead of using cache
 klua install --skip-checksum jq  # bypass SHA-256 verification (explicit)
 klua install --yes gh:user/repo  # approve remote build.steps / verify commands
 klua install sys:git,curl     # skip installed packages; batch the rest
+klua install sys:ffmpeg       # delegate and record a lightweight sys marker
 klua sync --lock              # write versions, URLs and digests to the lockfile
 klua sync --locked            # reproduce exactly; abort on any hash mismatch
 klua sync --dry-run           # preview packages and sys commands; change nothing
@@ -177,7 +186,7 @@ klua run --latest gh:user/repo # alias for --upgrade
 klua outdated                 # list installed gh/gl packages with newer releases
 klua search jq                # search alias shards across all registries
 klua info jq                  # resolution, versions, links, release metadata
-klua cleanup                  # prune old versions, broken links and caches
+klua cleanup                  # prune old unprotected versions; keep active/locked ones
 klua doctor                   # diagnose dirs, PATH, registries, links
 klua add gh:jqlang/jq fd      # record targets in packages.yaml
 klua sync                     # install everything in packages.yaml
@@ -185,10 +194,11 @@ klua sync https://host/dotfiles.yaml  # remote source, follows includes:
 klua upgrade --dry-run        # preview version changes and sys commands
 klua upgrade                  # upgrade all installed packages
 klua remove fd                # delete links, store dir, packages.yaml + lock entries
+klua remove sys:ffmpeg        # uninstall via recorded manager (sudo on Linux); drop marker
 klua remove jq@jq-1.7.1       # remove one version; relink the newest
 klua rm gh:jqlang/jq          # alias of remove
 klua uninstall url:https://host/tool.tar.gz  # alias of remove
-klua list                     # installed packages from the store
+klua list                     # store packages + sys:<pkg> (<manager>) markers
 klua init-manifest            # starter klua.yaml for a package repo
 klua repair                   # back up and restore a clean init.lua
 klua repair --dry-run         # preview backup path and diff, change nothing
@@ -221,4 +231,4 @@ klua.register_provider("my", function(rest, target)
 end)
 ```
 
-Lua から利用できるネイティブプリミティブ: `klua.info/warn/error`、`klua.file_exists/is_dir/is_executable/read_file/write_file/mkdir/copy/remove/list_dir`、`klua.find_executables`、`klua.readlink`、`klua.env`、`klua.exec`、`klua.confirm`、`klua.register_provider`、`klua.http_get/http_get_batch/http_head_redirect/download/download_batch`、`klua.sha256/sha256_text`、`klua.extract/is_archive`、`klua.symlink`、`klua.chmod_exec`、`klua.json_parse/yaml_parse`、`klua.platform`、`klua.paths`、`klua.version`。1 時間のキャッシュ有効期間を変更するには `klua.shard_ttl` を設定し、独自ハンドラーから `--no-cache`、`--skip-checksum`、`--lock`、`--locked`、`--yes`、`--latest`、`--upgrade`、`--dry-run` を確認するには `klua.cli_flags` を参照します。`klua.system` でシステムパッケージの検出・状態確認・インストールを上書きでき、`klua.lockfile` は解析済みのロックエントリと `require/get/record/verify/save/prune` ヘルパーを公開します。カスタムハンドラーで `klua.install_opts = { force = ..., link = ..., as = ... }` を設定すると、競合の上書き制御、プライマリリンクの改名、ストアのみ（実行専用）のインストールを指定できます。ここが「self-evolving」の部分です。`klua.commands.<name>` を再バインドするか `init.lua` でプロバイダーを登録すると、CLI の動作が即座に変わります。
+Lua から利用できるネイティブプリミティブ: `klua.info/warn/error`、`klua.file_exists/is_dir/is_executable/read_file/write_file/mkdir/copy/remove/list_dir`、`klua.find_executables`、`klua.readlink`、`klua.env`、`klua.exec`、`klua.confirm`、`klua.register_provider`、`klua.http_get/http_get_batch/http_head_redirect/download/download_batch`、`klua.sha256/sha256_text`、`klua.extract/is_archive`、`klua.symlink`、`klua.chmod_exec`、`klua.json_parse/yaml_parse`、`klua.platform`、`klua.paths`、`klua.version`。1 時間のキャッシュ有効期間を変更するには `klua.shard_ttl` を設定し、独自ハンドラーから `--no-cache`、`--skip-checksum`、`--lock`、`--locked`、`--yes`、`--latest`、`--upgrade`、`--dry-run` を確認するには `klua.cli_flags` を参照します。`klua.system` でシステムパッケージの検出・状態確認・インストール・削除を上書きでき、`klua.lockfile` は解析済みのロックエントリと `require/get/record/verify/save/prune` ヘルパーを公開します。カスタムハンドラーで `klua.install_opts = { force = ..., link = ..., as = ... }` を設定すると、競合の上書き制御、プライマリリンクの改名、ストアのみ（実行専用）のインストールを指定できます。ここが「self-evolving」の部分です。`klua.commands.<name>` を再バインドするか `init.lua` でプロバイダーを登録すると、CLI の動作が即座に変わります。
