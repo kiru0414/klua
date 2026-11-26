@@ -4,6 +4,8 @@ cmake_minimum_required(VERSION 3.24)
 # Their deprecation notices are not actionable by klua and would otherwise
 # make a clean configure noisy. klua's own CMake uses current APIs.
 set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
+# Allow dependencies with cmake_minimum_required < 3.5 to configure on CMake 4.0+.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 
 project(klua
     VERSION 0.9.1
@@ -53,12 +55,12 @@ FetchContent_MakeAvailable(cli11)
 # (which probes for a system Lua) never runs.
 FetchContent_Declare(sol2
     GIT_REPOSITORY https://github.com/ThePhD/sol2.git
-    GIT_TAG        v3.3.0
-    GIT_SHALLOW    TRUE)
+    GIT_TAG        d805d02)
 FetchContent_GetProperties(sol2)
 if(NOT sol2_POPULATED)
     FetchContent_Populate(sol2)
 endif()
+
 add_library(klua_sol2 INTERFACE)
 target_include_directories(klua_sol2 INTERFACE "${sol2_SOURCE_DIR}/include")
 

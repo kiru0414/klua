@@ -10,7 +10,7 @@ case "$ARCH" in
 esac
 
 INSTALL_DIR="${KLUA_INSTALL_DIR:-$HOME/.local/bin}"
-URL="https://github.com{OS}-${ARCH}.tar.gz"
+URL="https://github.com/kiru0414/klua/releases/latest/download/klua-${OS}-${ARCH}.tar.gz"
 
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -22,3 +22,12 @@ tar -xzf "$TMP_DIR/klua.tar.gz" -C "$TMP_DIR"
 mkdir -p "$INSTALL_DIR"
 install -m 755 "$TMP_DIR/klua" "$INSTALL_DIR/klua"
 echo "Installed klua to $INSTALL_DIR/klua"
+case ":$PATH:" in
+  *":$INSTALL_DIR:"*) ;;
+  *)
+    echo ""
+    echo "Note: $INSTALL_DIR is not in your PATH."
+    echo "Add this to your ~/.zshrc or ~/.bashrc:"
+    echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
+    ;;
+esac
