@@ -212,25 +212,29 @@ tracking/lifecycle release are implemented:
   template; a Lua `klua.verify.hook(context)` may inspect or reject the payload
   directly. Verification fails closed.
 
-**v0.9.1 — system tracking, API-free version discovery & safer lifecycle**
+  **v0.8.0 — explicit approval, previews & drift reporting**
 
-- System-delegated packages are now tracked. Installing `sys:<pkg>` or an
-  explicit manager scheme (`apt:`, `apt-get:`, `dnf:`, `yum:`, `pacman:`,
-  `apk:`, `brew:`) records a lightweight marker at
-  `~/.local/share/klua/store/sys/<manager>/<pkg>/`. `klua list` shows entries
-  such as `sys:ffmpeg (apt)`. `klua remove sys:<pkg>` unifies removal by
-  invoking the recorded manager's uninstaller (with sudo for non-root Linux
-  managers) and deleting the marker.
-- `klua versions` and `klua install --select` discover GitHub releases without
-  touching the REST API first: they try `releases.atom`, then the releases web
-  page, and only fall back to `api.github.com` if both fail. This avoids the
-  60-request/hour unauthenticated API limit.
-- `.klua-links` snapshots now store `<link_name>=<relative_target_path>` pairs,
-  so `klua install --as jq2 ...` keeps the custom `jq2` name when switching
-  versions with `klua use`. Legacy snapshots without `=` are still understood.
-- `klua cleanup` no longer deletes non-latest versions blindly: it protects
-  versions currently active via `~/.local/bin` symlinks and versions pinned in
-  `packages.lock.yaml`, while still removing genuinely old unprotected ones.
+- `install`, `remove`, `run`, `sync` and `upgrade` accept `--yes` / `-y`.
+  Remote `klua.yaml` `build.steps` and manifest `verify:` commands are printed
+  and must be approved interactively or with this flag; a denial fails the
+  install before any clone, build step or verification command runs.
+- `remove` prunes matching `packages.lock.yaml` entries even without `--lock`,
+  so a later `sync --locked` cannot resurrect a package you deliberately
+  removed. The baseline also exposes `klua.lockfile.prune(removed)` for custom
+  command handlers.
+- `run --upgrade` (alias `run --latest`) ignores a pinned `@tag`, stages the
+  newest release store-only, and then executes it. Flags after the target are
+  still forwarded to the package binary, not consumed by klua.
+- `url:` store paths are keyed by a 12-character SHA-256 prefix of the full
+  canonical URL: `store/url/<host>/<stem>-<url-hash>/direct`. Different URLs
+  with the same host and filename no longer collide in `info`, `remove` or
+  `klua run`.
+- `klua outdated [targets...]` compares installed `gh:` / `gl:` versions with
+  the newest release and lists available upgrades.
+- `sync --dry-run` and `upgrade --dry-run` preview actions, version changes and
+  generated `sys:` commands without changing the store, links or lockfile.
+  `--dry-run` cannot be combined with `--lock`.
+
 
 **v0.9.0 — version selection & offline switching**
 
@@ -260,28 +264,26 @@ tracking/lifecycle release are implemented:
   and package/lock entries as before, and a stale `--locked` pin for the
   removed version is dropped.
 
-**v0.8.0 — explicit approval, previews & drift reporting**
+**v0.9.1 — system tracking, API-free version discovery & safer lifecycle**
 
-- `install`, `remove`, `run`, `sync` and `upgrade` accept `--yes` / `-y`.
-  Remote `klua.yaml` `build.steps` and manifest `verify:` commands are printed
-  and must be approved interactively or with this flag; a denial fails the
-  install before any clone, build step or verification command runs.
-- `remove` prunes matching `packages.lock.yaml` entries even without `--lock`,
-  so a later `sync --locked` cannot resurrect a package you deliberately
-  removed. The baseline also exposes `klua.lockfile.prune(removed)` for custom
-  command handlers.
-- `run --upgrade` (alias `run --latest`) ignores a pinned `@tag`, stages the
-  newest release store-only, and then executes it. Flags after the target are
-  still forwarded to the package binary, not consumed by klua.
-- `url:` store paths are keyed by a 12-character SHA-256 prefix of the full
-  canonical URL: `store/url/<host>/<stem>-<url-hash>/direct`. Different URLs
-  with the same host and filename no longer collide in `info`, `remove` or
-  `klua run`.
-- `klua outdated [targets...]` compares installed `gh:` / `gl:` versions with
-  the newest release and lists available upgrades.
-- `sync --dry-run` and `upgrade --dry-run` preview actions, version changes and
-  generated `sys:` commands without changing the store, links or lockfile.
-  `--dry-run` cannot be combined with `--lock`.
+- System-delegated packages are now tracked. Installing `sys:<pkg>` or an
+  explicit manager scheme (`apt:`, `apt-get:`, `dnf:`, `yum:`, `pacman:`,
+  `apk:`, `brew:`) records a lightweight marker at
+  `~/.local/share/klua/store/sys/<manager>/<pkg>/`. `klua list` shows entries
+  such as `sys:ffmpeg (apt)`. `klua remove sys:<pkg>` unifies removal by
+  invoking the recorded manager's uninstaller (with sudo for non-root Linux
+  managers) and deleting the marker.
+- `klua versions` and `klua install --select` discover GitHub releases without
+  touching the REST API first: they try `releases.atom`, then the releases web
+  page, and only fall back to `api.github.com` if both fail. This avoids the
+  60-request/hour unauthenticated API limit.
+- `.klua-links` snapshots now store `<link_name>=<relative_target_path>` pairs,
+  so `klua install --as jq2 ...` keeps the custom `jq2` name when switching
+  versions with `klua use`. Legacy snapshots without `=` are still understood.
+- `klua cleanup` no longer deletes non-latest versions blindly: it protects
+  versions currently active via `~/.local/bin` symlinks and versions pinned in
+  `packages.lock.yaml`, while still removing genuinely old unprotected ones.
+
 
 See `AGENTS.md` for the full roadmap.
 
