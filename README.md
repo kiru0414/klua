@@ -6,6 +6,8 @@ A fast, zero-dependency, self-healing package manager built with **C++20** and
 
 > **Safer than Homebrew, simpler than Nix, and infinitely hackable in Lua.**
 
+![klua demo](docs/asset/demo.svg)
+
 Heavy lifting (HTTP, extraction, filesystem, YAML) lives in native C++20;
 resolution logic, providers and lifecycle hooks are extensible in Lua.
 Packages stay in an isolated per-package store, shared libraries never pollute
